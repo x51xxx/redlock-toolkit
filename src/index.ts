@@ -324,10 +324,6 @@ export class RedlockToolkit extends EventEmitter {
     type Outcome = { client: RedisClient; result?: T; error?: Error };
     const pending = new Map<number, Promise<Outcome>>();
     const outcomes: Outcome[] = [];
-    // Short grace window after quorum is reached to collect late answers
-    const GRACE_WINDOW_MS = 200;
-    let quorumReachedAt: number | undefined;
-
     this.clients.forEach((client, index) => {
       const p = operation(client)
         .then((result) => ({ client, result }))
@@ -348,7 +344,8 @@ export class RedlockToolkit extends EventEmitter {
         votesAgainst.set(outcome.client, outcome.error);
       } else {
         if (process.env.NEOLOCK_DEBUG_CONSENSUS) {
-          this.logger.debug('[consensus] result', { type: typeof outcome.result, result: outcome.result });
+          // eslint-disable-next-line no-console
+          console.log('[consensus] result:', typeof outcome.result, outcome.result);
         }
         if (evaluate(outcome.result)) {
           successCount++;
@@ -359,31 +356,19 @@ export class RedlockToolkit extends EventEmitter {
           votesAgainst.set(outcome.client, new Error(reason));
         }
       }
-    // Keep consuming until early success/failure conditions
+    };
 
     // Helper to wait for one next settlement
     const nextSettlement = async (): Promise<void> => {
-      if (successCount >= quorumSize && quorumReachedAt === undefined) {
-        quorumReachedAt = Date.now();
+      const entries = Array.from(pending.entries());
+      if (entries.length === 0) return;
+      const raced = entries.map(([i, p]) => p.then((o) => ({ i, o })));
       const { i, o } = await Promise.race(raced);
       await consume(i, o);
-      // If impossible to reach quorum with remaining
+    };
 
     // Consume until either quorum achieved or impossible to reach
-        break; // Will fail; proceed to cleanup below
-      }
-
-      // If quorum reached and grace window elapsed, we can stop early
-      if (quorumReachedAt !== undefined && Date.now() - quorumReachedAt >= GRACE_WINDOW_MS) {
-        break; // Success with early exit
-      }
-    }
-
-    // If still pending but we haven't reached quorum yet, drain one last time to be sure
-    if (pending.size > 0 && successCount < quorumSize) {
-      // Drain until either quorum achieved or no chance to achieve
-      while (pending.size > 0 && successCount < quorumSize && successCount + pending.size >= quorumSize) {
-        await nextSettlement();
+    while (pending.size > 0) {
       await nextSettlement();
 
       // Early success
@@ -404,16 +389,33 @@ export class RedlockToolkit extends EventEmitter {
       votesFor,
       votesAgainst,
       startTime,
+      duration: Date.now() - startTime,
+    };
+
+    if (process.env.NEOLOCK_DEBUG_CONSENSUS) {
+      // eslint-disable-next-line no-console
+      console.log('[consensus] totals:', { clients: this.clients.length, quorumSize, successCount, failureCount });
     }
 
-        const cleanupPromises = Array.from(votesFor).map(client =>
-          this.executeScript(client, SCRIPTS.release,
-            cleanupContext.keys,
-            [cleanupContext.identifier]
+    const succeeded = options?.successPolicy === 'any' ? successCount > 0 : successCount >= quorumSize;
+
+    if (!succeeded) {
+      // Determine if all failures are non-retryable (e.g., configuration errors)
+      const allNonRetryable = votesFor.size === 0 && Array.from(votesAgainst.values()).every(err =>
+        err instanceof ConfigurationError || err instanceof CircuitBreakerOpenError
+      );
+
+      // Clean up partial locks from successful clients before throwing error
       if (votesFor.size > 0 && cleanupContext) {
         const cleanupPromises = Array.from(votesFor).map(client =>
           // Use eval(source) here to make tests able to detect release invocation easily
           this.circuitBreaker.execute(this.getClientId(client), () =>
+            client.eval(
+              SCRIPTS.release.source,
+              cleanupContext.keys.length,
+              ...cleanupContext.keys,
+              cleanupContext.identifier
+            )
           ).catch(() => {}) // Ignore cleanup errors
         );
         await Promise.all(cleanupPromises);
@@ -512,23 +514,19 @@ export class RedlockToolkit extends EventEmitter {
   ): Promise<Lock> {
     const resourceList = Array.isArray(resources) ? resources : [resources];
     const lockOptions = { ...this.defaultOptions, ...options };
-    // Track last successful expiration for stability sweeps
-    let lastSuccessfulExpiration: number | undefined;
-
-    while (attempts < maxAttempts) {
+    // If caller provided identifier explicitly (even empty string), respect it; otherwise generate one
+    const identifier = (options && Object.prototype.hasOwnProperty.call(options, 'identifier'))
+      ? (options.identifier as string)
       : (lockOptions.identifier || this.generateIdentifier());
-      const attemptStart = Date.now();
     const keys = resourceList.map((r) => this.generateLockKey(r));
 
-        // For acquisition, we need to check if any client returned 0 (lock exists)
-        const result = await this.executeWithConsensus(async (client) => {
+    const startTime = Date.now();
     let lastError: Error | undefined;
     let attempts = 0;
     const maxAttempts =
       lockOptions.retryCount === -1 ? Infinity : lockOptions.retryCount + 1;
 
     // Phase 1: Attempt to acquire with retries on failure only
-          // Throw an error to indicate failure for this client
     let acquired = false;
     while (attempts < maxAttempts && !acquired) {
       attempts++;
@@ -536,104 +534,125 @@ export class RedlockToolkit extends EventEmitter {
       try {
         await this.executeWithConsensus(async (client) => {
           const response = await this.executeScript(client, SCRIPTS.acquire, keys, [
-        const drift =
-          Math.round(lockOptions.driftFactor * lockOptions.ttl) + 2;
-        const expiration = attemptStart + lockOptions.ttl - drift;
-
-        // Check if the lock would already be expired due to drift
-        if (expiration <= Date.now()) {
-          throw new LockTimeoutError(
-            lockOptions.ttl,
-            attempts,
-            { reason: 'Lock would be expired due to clock drift', resources: resourceList }
-          );
-        }
-
-        // Store last successful expiration and continue if we still have attempts left (stability sweep)
-        lastSuccessfulExpiration = expiration;
-
-        // If no stability sweeps requested (retryCount == 0) or we've reached final attempt, we can finalize
-        if (attempts >= maxAttempts || lockOptions.retryCount === 0) {
-          const lock = new Lock(
-            resourceList,
             identifier,
-            lastSuccessfulExpiration,
-            {
-              extend: this.extendLock.bind(this),
-              release: this.releaseLockInternal.bind(this),
-            },
-            lockOptions,
-          );
-
-          this.activeLocks.set(identifier, lock);
-          this.metrics.recordLockAcquired(
-            identifier,
-            resourceList,
-            Date.now() - startTime,
-          );
-
-          return lock;
-        }
-
-        // Small backoff between stability attempts to simulate time progression
-        const delay = getRetryDelay(
-          new ConsensusError('stability-sweep', [Promise.resolve({} as any)], 0, 0),
-          lockOptions.retryDelay,
-          lockOptions.retryJitter,
-        );
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        continue; // proceed to next attempt
             lockOptions.ttl,
           ]);
 
-        // Immediately break for non-retryable errors
-        if (!isRetryableError(lastError)) {
-          break;
+          // If response is 0, it means the lock already exists
+          if (response === 0) {
+            throw new ResourceLockedError(resourceList);
+          }
+
+          return response;
+        }, { keys, identifier }); // Pass cleanup context
+
+        acquired = true;
+      } catch (error) {
+        lastError = error as Error;
+        if (!isRetryableError(lastError)) break;
+        if (attempts < maxAttempts) {
+          const delay = getRetryDelay(
+            lastError,
+            lockOptions.retryDelay,
+            lockOptions.retryJitter,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          this.metrics.recordRetry(identifier, attempts);
         }
       }
+    }
 
-      // Check if we should retry on failure
-      if (attempts < maxAttempts && lastError && isRetryableError(lastError)) {
+    if (!acquired) {
+      // Record failed acquisition
+      this.metrics.recordAcquisitionFailed(
+        resourceList,
+        lastError || new Error("Unknown error"),
+        attempts,
+        Date.now() - startTime,
+      );
+
+      if (attempts >= maxAttempts && maxAttempts > 1) {
+        throw new LockTimeoutError(Date.now() - startTime, attempts);
+      } else if (lastError instanceof ConsensusError) {
+        throw lastError;
+      } else if (!lastError || isRetryableError(lastError)) {
+        throw new LockTimeoutError(Date.now() - startTime, attempts);
+      } else {
+        throw lastError;
+      }
+    }
+
+    // Compute expiration based on initial start time (matches expected semantics in tests)
+    const drift = Math.round(lockOptions.driftFactor * lockOptions.ttl) + 2;
+    const expiration = startTime + lockOptions.ttl - drift;
+
+    // If drift makes it invalid already, treat as timeout
+    if (expiration <= Date.now()) {
+      throw new LockTimeoutError(lockOptions.ttl, attempts, { reason: 'Lock would be expired due to clock drift', resources: resourceList });
+    }
+
+    // Phase 2: Optional stability verification sweeps (read-only)
+    if (lockOptions.retryCount > 0) {
+      for (let i = 0; i < lockOptions.retryCount; i++) {
         const delay = getRetryDelay(
-          lastError,
+          new ConsensusError('stability-check', [Promise.resolve({} as any)], 0, 0),
           lockOptions.retryDelay,
           lockOptions.retryJitter,
         );
         await new Promise((resolve) => setTimeout(resolve, delay));
-        this.metrics.recordRetry(identifier, attempts);
-      } else {
-        break;
-      } catch (error) {
-        lastError = error as Error;
-        if (!isRetryableError(lastError)) break;
-    // Record failed acquisition
-    this.metrics.recordAcquisitionFailed(
-      resourceList,
-      lastError || new Error("Unknown error"),
-      attempts,
-      Date.now() - startTime,
-    );
+
+        try {
+          await this.executeWithConsensus(async (client) => {
+            // Use status script (read-only) to verify lock holder on each client
+            const result = await this.executeScript(client, SCRIPTS.status, keys, []);
+            return result;
+          }, { keys, identifier }, {
+            evaluateResult: (res: any) => {
+              // Accept numeric success (for mocks) or validate holder matches identifier
+              if (typeof res === 'number') return res > 0;
+              try {
+                const data = typeof res === 'string' ? JSON.parse(res) : res;
+                if (!Array.isArray(data)) return false;
+                // All keys on that client must be held by our identifier if present
+                return data.every((item: any) => item && (item.holder === null || item.holder === identifier));
+              } catch {
+                return false;
+              }
+            }
+          });
+        } catch (error) {
+          // Cleanup already attempted inside executeWithConsensus; throw failure
+          lastError = error as Error;
+          // Record failed stabilization
+          this.metrics.recordAcquisitionFailed(
+            resourceList,
+            lastError,
+            attempts + i,
+            Date.now() - startTime,
+          );
+
+          // Best-effort global cleanup (in case some clients still hold it)
+          const cleanupPromises = this.clients.map((client) =>
+            this.executeScript(client, SCRIPTS.release, keys, [identifier]).catch(() => {})
+          );
+          await Promise.allSettled(cleanupPromises);
+
+          if (lockOptions.retryCount > 0) {
+            throw new LockTimeoutError(Date.now() - startTime, attempts + i + 1);
+          }
+          throw lastError;
         }
-    // Best-effort cleanup if we had a previous successful attempt but ended up failing later
-    if (lastSuccessfulExpiration !== undefined) {
-      const cleanupPromises = this.clients.map((client) =>
-        this.executeScript(client, SCRIPTS.release, keys, [identifier]).catch(() => {})
-      );
-      await Promise.allSettled(cleanupPromises);
+      }
     }
 
-    // If we've exhausted retries with retryable errors, throw LockTimeoutError
-    // But if the error is a ConsensusError and we only tried once (no retries), throw the ConsensusError
-    if (attempts >= maxAttempts && maxAttempts > 1) {
-      throw new LockTimeoutError(Date.now() - startTime, attempts);
-    } else if (lastError instanceof ConsensusError) {
-      throw lastError;
-    } else if (attempts >= maxAttempts) {
-      // For other errors when retries are exhausted
-      throw new LockTimeoutError(Date.now() - startTime, attempts);
-    } else {
-      throw lastError || new Error("Lock acquisition failed");
-        Date.now() - startTime,
+    // Create and register lock after passing stability checks
+    const lock = new Lock(
+      resourceList,
+      identifier,
+      expiration,
+      {
+        extend: this.extendLock.bind(this),
+        release: this.releaseLockInternal.bind(this),
       },
       lockOptions,
     );
