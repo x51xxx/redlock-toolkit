@@ -89,7 +89,7 @@ export class CircuitBreaker extends EventEmitter {
           `Operation timed out after ${this.options.operationTimeout}ms`,
         );
         // Mark this as a timeout error for proper handling
-        (timeoutError as any).isTimeout = true;
+        (timeoutError as { isTimeout?: boolean }).isTimeout = true;
         reject(timeoutError);
       }, this.options.operationTimeout);
 
@@ -368,9 +368,9 @@ export class CircuitBreakerManager {
   }
 
   // EventEmitter methods
-  private listeners = new Map<string, Function[]>();
+  private listeners = new Map<string, ((...args: unknown[]) => void)[]>();
 
-  on(event: string, listener: Function): this {
+  on(event: string, listener: (...args: unknown[]) => void): this {
     if (!this.listeners.has(event)) {
       this.listeners.set(event, []);
     }
@@ -378,7 +378,7 @@ export class CircuitBreakerManager {
     return this;
   }
 
-  emit(event: string, ...args: any[]): boolean {
+  emit(event: string, ...args: unknown[]): boolean {
     const eventListeners = this.listeners.get(event);
     if (eventListeners) {
       eventListeners.forEach((listener) => listener(...args));

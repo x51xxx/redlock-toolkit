@@ -63,8 +63,12 @@ npm install @trishchuk/redlock-toolkit
 
 ### Import
 ```typescript
-// Main locking algorithms and patterns
-import { Redlock, OptimisticRedlock, CircuitBreaker } from '@trishchuk/redlock-toolkit';
+// Main locking class and errors
+import RedlockToolkit, { 
+  ResourceLockedError,
+  LockTimeoutError,
+  ConsensusError
+} from '@trishchuk/redlock-toolkit';
 import Redis from 'ioredis';
 ```
 
@@ -77,9 +81,10 @@ const redis = new Redis({
   retryStrategy: (times) => Math.min(times * 50, 2000) // Exponential backoff
 });
 
-// Initialize Redlock with single or multiple Redis instances
+// Initialize RedlockToolkit with single or multiple Redis instances
 // Multiple instances provide fault tolerance (recommended for production)
-const redlock = new Redlock([redis], {
+const redlock = new RedlockToolkit({
+  clients: [redis],
   // Clock drift compensation - accounts for time differences between servers
   driftFactor: 0.01, // multiplied by TTL to determine drift time
   
@@ -206,10 +211,11 @@ try {
 ## Error Handling
 
 ```typescript
-import { 
-  ResourceLockedError,  // Thrown when resource is already locked
-  ExecutionError,       // Thrown when execution fails within lock
-  LockError            // Base error class for all lock-related errors
+import RedlockToolkit, { 
+  ResourceLockedError, 
+  LockTimeoutError, 
+  ConsensusError,
+  RedlockToolkitError
 } from '@trishchuk/redlock-toolkit';
 
 // Comprehensive error handling pattern
@@ -226,10 +232,17 @@ try {
     // Another process holds the lock
     console.log('Resource is busy, retrying later...');
     await scheduleRetry();
-  } else if (error instanceof ExecutionError) {
-    // Operation failed but lock was properly released
-    console.error('Operation failed:', error.cause);
-    await rollback();
+  } else if (error instanceof LockTimeoutError) {
+    // Failed to acquire lock within the given time and retries
+    console.error(`Could not acquire lock after ${error.attemptsCount} attempts.`);
+    await-notify-admin();
+  } else if (error instanceof ConsensusError) {
+    // Not enough redis instances agreed to grant the lock
+    console.error(`Failed to achieve quorum. Required: ${error.requiredQuorum}, got: ${error.achievedVotes}`);
+    await-notify-admin();
+  } else if (error instanceof RedlockToolkitError) {
+    // A known error from the library
+    console.error('A managed error occurred:', error);
   } else {
     // Unexpected error (network, Redis connection, etc.)
     console.error('System error:', error);
@@ -325,7 +338,7 @@ redlock.on('release', (lock) => {
   metrics.histogram('locks.held_time', lock.heldTime);
 });
 
-redlock.on('extend', (lock, extension) => {
+redlock.on('extend', (resources, identifier, timestamp) => {
   metrics.increment('locks.extended');
 });
 ```

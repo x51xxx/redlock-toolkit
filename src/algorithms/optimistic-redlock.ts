@@ -3,10 +3,8 @@
  * Extends the base Redlock algorithm with optimistic concurrency control
  */
 
-import { EventEmitter } from "events";
-import { randomBytes } from "crypto";
 import { RedisClient } from "../core/types";
-import { Redlock, RedlockLock, RedlockOptions } from "./redlock";
+import { InternalRedlock as Redlock, RedlockOptions } from "./redlock";
 
 export interface OptimisticLockOptions extends RedlockOptions {
   /**
@@ -257,14 +255,14 @@ export class OptimisticRedlock extends Redlock {
             [resource],
             [],
           );
-          if (result) {
+          if (result && Array.isArray(result) && result.length >= 2) {
             return {
-              value: result[0],
-              version: parseInt(result[1], 10),
+              value: result[0] as string,
+              version: parseInt(result[1] as string, 10),
             };
           }
           return null;
-        } catch (error) {
+        } catch {
           return null;
         }
       }),
@@ -328,8 +326,8 @@ export class OptimisticRedlock extends Redlock {
             [resource],
             [value, expectedVersion.toString(), ttl?.toString() || ""],
           );
-          return result ? parseInt(result, 10) : null;
-        } catch (error) {
+          return result ? parseInt(String(result), 10) : null;
+        } catch {
           return null;
         }
       }),
@@ -364,8 +362,8 @@ export class OptimisticRedlock extends Redlock {
             [resource],
             [expectedValue, newValue, ttl?.toString() || ""],
           );
-          return result ? parseInt(result, 10) : null;
-        } catch (error) {
+          return result ? parseInt(String(result), 10) : null;
+        } catch {
           return null;
         }
       }),
@@ -398,7 +396,7 @@ export class OptimisticRedlock extends Redlock {
             [expectedVersion.toString()],
           );
           return result === 1;
-        } catch (error) {
+        } catch {
           return false;
         }
       }),
@@ -527,7 +525,7 @@ export class OptimisticRedlock extends Redlock {
             resource,
             version.toString(),
           );
-        } catch (error) {
+        } catch {
           // Ignore rollback errors
         }
       }),
@@ -542,7 +540,7 @@ export class OptimisticRedlock extends Redlock {
     script: string,
     keys: string[],
     argv: string[],
-  ): Promise<any> {
+  ): Promise<unknown> {
     try {
       return await client.eval(script, keys.length, ...keys, ...argv);
     } catch (error) {

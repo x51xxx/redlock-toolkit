@@ -15,46 +15,8 @@ import {
   LockExtensionError,
   LockReleaseError,
 } from "./errors";
-import { EventEmitter } from "events";
+import { AutoExtensionManager } from "../utils/auto-extension-manager";
 
-/**
- * Lock Signal implementation for auto-extending locks
- */
-class LockSignalImpl extends EventEmitter implements LockSignal {
-  private _aborted = false;
-  private _error?: Error;
-
-  constructor(public readonly expiration: number) {
-    super();
-  }
-
-  get aborted(): boolean {
-    return this._aborted;
-  }
-
-  get error(): Error | undefined {
-    return this._error;
-  }
-
-  /**
-   * Abort the lock signal
-   */
-  abort(error?: Error): void {
-    if (this._aborted) return;
-
-    this._aborted = true;
-    this._error = error;
-    this.emit("abort");
-  }
-
-  addEventListener(type: "abort", listener: () => void): void {
-    this.on(type, listener);
-  }
-
-  removeEventListener(type: "abort", listener: () => void): void {
-    this.off(type, listener);
-  }
-}
 
 /**
  * Represents an acquired distributed lock
@@ -64,6 +26,7 @@ export class Lock {
   private _extensions = 0;
   private _released = false;
   private readonly acquisitionTime = Date.now();
+  private autoExtensionManager?: AutoExtensionManager;
 
   constructor(
     public readonly resources: string[],
@@ -170,6 +133,8 @@ export class Lock {
     if (result.success) {
       this._expiration = result.expiration;
       this._extensions++;
+      // Update auto-extension manager if active
+      this.autoExtensionManager?.updateExpiration(result.expiration);
       return this;
     } else {
       throw new LockExtensionError(
@@ -201,13 +166,9 @@ export class Lock {
       };
     }
 
-    try {
-      const result = await this.lockManager.release(this, options);
-      this._released = true; // Mark as released even if partially successful
-      return result;
-    } catch (error) {
-      throw error;
-    }
+    const result = await this.lockManager.release(this, options);
+    this._released = true; // Mark as released even if partially successful
+    return result;
   }
 
   /**
@@ -233,81 +194,44 @@ export class Lock {
       );
     }
 
-    const signal = new LockSignalImpl(this._expiration);
-    let autoExtensionTimer: NodeJS.Timeout | undefined;
-    let extensionPromise: Promise<void> | undefined;
-
-    const scheduleExtension = () => {
-      const timeUntilExtension = this.timeToExpiration - autoExtendThreshold;
-
-      // Always use setTimeout to prevent stack overflow, even for immediate execution
-      // For testing purposes, ensure the delay is small enough to trigger during tests
-      const delay = Math.max(0, Math.min(timeUntilExtension, 100));
-
-      autoExtensionTimer = setTimeout(() => {
-        autoExtensionTimer = undefined;
-        extensionPromise = performExtension();
-      }, delay);
-    };
-
-    const performExtension = async (): Promise<void> => {
-      try {
-        if (this._released || this.isExpired) {
-          signal.abort(new LockExpiredError(this._expiration));
-          return;
+    // Create auto-extension manager
+    this.autoExtensionManager = new AutoExtensionManager({
+      ttl: extensionTtl,
+      autoExtendThreshold,
+      expiration: this._expiration,
+      isValid: () => !this._released && !this.isExpired,
+      extend: async (ttl) => {
+        const result = await this.lockManager.extend(this, ttl, options);
+        if (result.success) {
+          this._expiration = result.expiration;
+          this._extensions++;
         }
-
-        const result = await this.lockManager.extend(
-          this,
-          extensionTtl,
-          options,
-        );
-
-        if (!result.success) {
-          // Extension failed - abort immediately
-          signal.abort(
-            new LockExtensionError(
-              this.resources,
-              this.identifier,
-              this._expiration,
-              { message: "Auto-extension failed" },
-            ),
+        return result;
+      },
+      onError: (error) => {
+        if (error instanceof LockExpiredError) {
+          // Already a proper error type
+        } else {
+          // Convert to LockExtensionError
+          error = new LockExtensionError(
+            this.resources,
+            this.identifier,
+            this._expiration,
+            { message: error.message },
           );
-          return;
         }
+      },
+    });
 
-        // Update expiration on successful extension
-        this._expiration = result.expiration;
-        this._extensions++;
-
-        // Schedule next extension if lock is still valid
-        if (!this._released && !signal.aborted) {
-          scheduleExtension();
-        }
-      } catch (error) {
-        signal.abort(error as Error);
-      }
-    };
-
-    // Start auto-extension cycle only if autoExtendThreshold > 0
-    if (autoExtendThreshold > 0) {
-      scheduleExtension();
-    }
+    // Start auto-extension and get signal
+    const signal = this.autoExtensionManager.start() as LockSignal;
 
     try {
       return await routine(signal);
     } finally {
-      // Clean up auto-extension
-      if (autoExtensionTimer) {
-        clearTimeout(autoExtensionTimer);
-      }
-
-      // Wait for any ongoing extension to complete
-      if (extensionPromise) {
-        await extensionPromise.catch(() => {
-          // Ignore extension errors during cleanup
-        });
-      }
+      // Stop auto-extension
+      await this.autoExtensionManager.stop();
+      this.autoExtensionManager = undefined;
 
       // Release the lock
       await this.release(options).catch(() => {
@@ -337,7 +261,7 @@ export class Lock {
   /**
    * Convert lock to JSON representation
    */
-  toJSON(): Record<string, any> {
+  toJSON(): Record<string, unknown> {
     return {
       resources: this.resources,
       identifier: this.identifier,

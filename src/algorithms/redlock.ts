@@ -11,6 +11,8 @@ import {
   EXTEND_SCRIPT,
   RELEASE_SCRIPT,
 } from "../utils/scripts";
+import { AutoExtensionManager } from "../utils/auto-extension-manager";
+import { Logger, SilentLogger } from "../core/logger";
 
 export interface RedlockOptions {
   /**
@@ -62,22 +64,33 @@ const DEFAULT_OPTIONS: RedlockOptions = {
 
 // Using advanced scripts from scripts.ts that support multiple resources
 
-export class RedlockLock {
+/**
+ * Internal implementation of Redlock lock instance.
+ * @internal This is an internal implementation detail. Use RedlockToolkit instead.
+ */
+export class InternalRedlockLock {
   public readonly resources: string[];
   public readonly value: string;
   public readonly ttl: number;
-  public readonly validity: number;
-  private extensionTimer?: NodeJS.Timeout;
+  private _validity: number;
+  private autoExtensionManager?: AutoExtensionManager;
   private abortController?: AbortController;
 
   constructor(
-    public readonly redlock: Redlock,
+    public readonly redlock: InternalRedlock,
     resource: RedlockResource,
   ) {
     this.resources = resource.resources;
     this.value = resource.value;
     this.ttl = resource.ttl;
-    this.validity = resource.validity;
+    this._validity = resource.validity;
+  }
+
+  /**
+   * Get lock validity expiration timestamp
+   */
+  get validity(): number {
+    return this._validity;
   }
 
   /**
@@ -97,7 +110,7 @@ export class RedlockLock {
   /**
    * Extend the lock
    */
-  async extend(ttl: number): Promise<RedlockLock> {
+  async extend(ttl: number): Promise<InternalRedlockLock> {
     if (!this.isValid) {
       throw new Error("Cannot extend expired lock");
     }
@@ -109,7 +122,10 @@ export class RedlockLock {
    * Release the lock
    */
   async release(): Promise<void> {
-    this.stopAutoExtension();
+    if (this.autoExtensionManager) {
+      await this.autoExtensionManager.stop();
+      this.autoExtensionManager = undefined;
+    }
     await this.redlock.release(this);
   }
 
@@ -122,67 +138,61 @@ export class RedlockLock {
   ): Promise<T> {
     const controller = new AbortController();
     this.abortController = controller;
-
+    
+    const extensionTtl = options.extensionTtl || this.ttl;
+    const logger = this.redlock.logger;
+    
+    // Create auto-extension manager
+    this.autoExtensionManager = new AutoExtensionManager({
+      ttl: extensionTtl,
+      autoExtendThreshold: this.redlock.options.automaticExtensionThreshold,
+      expiration: this._validity,
+      isValid: () => this.isValid,
+      extend: async (ttl) => {
+        logger.debug(`Auto-extending lock, remaining: ${this.remainingTtl}ms`);
+        const extended = await this.extend(ttl);
+        this._validity = extended.validity;
+        logger.debug(`Lock extended, new remaining: ${this.remainingTtl}ms`);
+        return { success: true, expiration: extended.validity };
+      },
+      onError: (error) => {
+        logger.error(`Auto-extension failed: ${error.message}`);
+        controller.abort(error);
+      },
+    });
+    
+    // Start auto-extension
+    const extensionSignal = this.autoExtensionManager.start();
+    
+    // Link extension signal to abort controller
+    extensionSignal.on('abort', () => {
+      if (extensionSignal.error) {
+        controller.abort(extensionSignal.error);
+      }
+    });
+    
     try {
-      this.startAutoExtension(options.extensionTtl || this.ttl);
       return await routine(controller.signal);
     } finally {
-      this.stopAutoExtension();
+      await this.autoExtensionManager.stop();
+      this.autoExtensionManager = undefined;
       controller.abort();
     }
   }
 
-  private startAutoExtension(extensionTtl: number): void {
-    if (this.redlock.options.automaticExtensionThreshold <= 0) {
-      return;
-    }
-
-    const checkInterval = Math.min(
-      this.redlock.options.automaticExtensionThreshold / 2,
-      500,
-    );
-
-    this.extensionTimer = setInterval(async () => {
-      try {
-        if (
-          this.remainingTtl <=
-            this.redlock.options.automaticExtensionThreshold &&
-          this.isValid
-        ) {
-          console.log(
-            `   🔄 Auto-extending lock, remaining: ${this.remainingTtl}ms`,
-          );
-          const extended = await this.extend(extensionTtl);
-          // Update this lock instance with extended values
-          (this as any).validity = extended.validity;
-          console.log(
-            `   ✅ Lock extended, new remaining: ${this.remainingTtl}ms`,
-          );
-        }
-      } catch (error) {
-        const err = error as Error;
-        console.log(`   ❌ Auto-extension failed: ${err.message}`);
-        // Extension failed - abort the operation
-        this.abortController?.abort(err);
-        this.stopAutoExtension();
-      }
-    }, checkInterval);
-  }
-
-  private stopAutoExtension(): void {
-    if (this.extensionTimer) {
-      clearInterval(this.extensionTimer);
-      this.extensionTimer = undefined;
-    }
-  }
 }
 
-export class Redlock extends EventEmitter {
+/**
+ * Internal implementation of the Redlock algorithm.
+ * @internal This is an internal implementation detail. Use RedlockToolkit instead.
+ */
+export class InternalRedlock extends EventEmitter {
   protected readonly clients: RedisClient[];
   public readonly options: RedlockOptions;
+  public readonly logger: Logger;
   private scriptsLoaded = false;
 
-  constructor(clients: RedisClient[], options: Partial<RedlockOptions> = {}) {
+  constructor(clients: RedisClient[], options: Partial<RedlockOptions> = {}, logger?: Logger) {
     super();
 
     if (!clients || clients.length === 0) {
@@ -191,6 +201,7 @@ export class Redlock extends EventEmitter {
 
     this.clients = [...clients];
     this.options = { ...DEFAULT_OPTIONS, ...options };
+    this.logger = logger || new SilentLogger();
   }
 
   /**
@@ -200,7 +211,7 @@ export class Redlock extends EventEmitter {
     resources: string | string[],
     ttl: number,
     options: Partial<RedlockOptions> = {},
-  ): Promise<RedlockLock> {
+  ): Promise<InternalRedlockLock> {
     const resourceList = Array.isArray(resources) ? resources : [resources];
     const opts = { ...this.options, ...options };
     const value = this.generateValue();
@@ -209,13 +220,11 @@ export class Redlock extends EventEmitter {
     const maxAttempts = opts.retryCount + 1;
 
     while (attempt < maxAttempts) {
-      const startTime = Date.now();
-
       try {
         const result = await this.attemptLock(resourceList, value, ttl);
 
         if (result) {
-          const lock = new RedlockLock(this, result);
+          const lock = new InternalRedlockLock(this, result);
           this.emit("clientLocked", resourceList, value, ttl);
           return lock;
         }
@@ -239,7 +248,7 @@ export class Redlock extends EventEmitter {
   /**
    * Extend an existing lock
    */
-  async extend(lock: RedlockLock, ttl: number): Promise<RedlockLock> {
+  async extend(lock: InternalRedlockLock, ttl: number): Promise<InternalRedlockLock> {
     const startTime = Date.now();
     const drift = Math.round(this.options.driftFactor * ttl) + 2;
 
@@ -252,7 +261,7 @@ export class Redlock extends EventEmitter {
           [lock.value, ttl.toString()],
         );
         return result === lock.resources.length;
-      } catch (error) {
+      } catch {
         return false;
       }
     });
@@ -265,7 +274,7 @@ export class Redlock extends EventEmitter {
     const validity = ttl - elapsed - drift;
 
     if (successCount >= quorum && validity > 0) {
-      return new RedlockLock(this, {
+      return new InternalRedlockLock(this, {
         resources: lock.resources,
         value: lock.value,
         ttl,
@@ -281,14 +290,14 @@ export class Redlock extends EventEmitter {
   /**
    * Release a lock
    */
-  async release(lock: RedlockLock): Promise<void> {
+  async release(lock: InternalRedlockLock): Promise<void> {
     const promises = this.clients.map(async (client) => {
       try {
         await this.executeScript(client, RELEASE_SCRIPT, lock.resources, [
           lock.value,
         ]);
         return true;
-      } catch (error) {
+      } catch {
         return false;
       }
     });
@@ -300,12 +309,12 @@ export class Redlock extends EventEmitter {
   /**
    * Force release a lock (without ownership check)
    */
-  async forceRelease(lock: RedlockLock): Promise<void> {
+  async forceRelease(lock: InternalRedlockLock): Promise<void> {
     const promises = this.clients.map(async (client) => {
       try {
         await client.del(...lock.resources);
         return true;
-      } catch (error) {
+      } catch {
         return false;
       }
     });
@@ -351,7 +360,7 @@ export class Redlock extends EventEmitter {
           [value, ttl.toString()],
         );
         return result === resources.length; // All resources must be acquired
-      } catch (error) {
+      } catch {
         return false;
       }
     });
@@ -377,7 +386,7 @@ export class Redlock extends EventEmitter {
       if (results[index]) {
         try {
           await this.executeScript(client, RELEASE_SCRIPT, resources, [value]);
-        } catch (error) {
+        } catch {
           // Ignore release errors
         }
       }
@@ -395,7 +404,7 @@ export class Redlock extends EventEmitter {
     script: string,
     keys: string[],
     argv: string[],
-  ): Promise<any> {
+  ): Promise<unknown> {
     try {
       return await client.eval(script, keys.length, ...keys, ...argv);
     } catch (error) {
@@ -425,4 +434,5 @@ export class Redlock extends EventEmitter {
   }
 }
 
-export default Redlock;
+// Note: This export is deprecated. Use RedlockToolkit from the main export instead.
+export default InternalRedlock;

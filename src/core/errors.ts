@@ -10,9 +10,9 @@ import { LockStats } from "./types";
  */
 export abstract class RedlockToolkitError extends Error {
   public readonly timestamp: number;
-  public readonly context?: Record<string, any>;
+  public readonly context?: Record<string, unknown>;
 
-  constructor(message: string, context?: Record<string, any>) {
+  constructor(message: string, context?: Record<string, unknown>) {
     super(message);
     this.name = this.constructor.name;
     this.timestamp = Date.now();
@@ -27,7 +27,7 @@ export abstract class RedlockToolkitError extends Error {
   /**
    * Get error details as JSON
    */
-  toJSON(): Record<string, any> {
+  toJSON(): Record<string, unknown> {
     return {
       name: this.name,
       message: this.message,
@@ -48,7 +48,7 @@ export class ResourceLockedError extends RedlockToolkitError {
   constructor(
     resources: string[],
     currentHolder?: string,
-    context?: Record<string, any>,
+    context?: Record<string, unknown>,
   ) {
     const resourceList = resources.join(", ");
     const holderInfo = currentHolder ? ` (held by: ${currentHolder})` : "";
@@ -72,7 +72,7 @@ export class ConsensusError extends RedlockToolkitError {
     attempts: Promise<LockStats>[],
     requiredQuorum: number,
     achievedVotes: number,
-    context?: Record<string, any>,
+    context?: Record<string, unknown>,
   ) {
     super(message, context);
     this.attempts = attempts;
@@ -91,7 +91,7 @@ export class LockTimeoutError extends RedlockToolkitError {
   constructor(
     timeoutMs: number,
     attemptsCount: number,
-    context?: Record<string, any>,
+    context?: Record<string, unknown>,
   ) {
     super(
       `Lock acquisition timed out after ${timeoutMs}ms (${attemptsCount} attempts)`,
@@ -109,7 +109,7 @@ export class LockExpiredError extends RedlockToolkitError {
   public readonly expiration: number;
   public readonly currentTime: number;
 
-  constructor(expiration: number, context?: Record<string, any>) {
+  constructor(expiration: number, context?: Record<string, unknown>) {
     const currentTime = Date.now();
     super(
       `Lock expired at ${new Date(expiration).toISOString()} (current: ${new Date(currentTime).toISOString()})`,
@@ -134,7 +134,7 @@ export class LockReleaseError extends RedlockToolkitError {
     identifier: string,
     releasedCount: number,
     totalClients: number,
-    context?: Record<string, any>,
+    context?: Record<string, unknown>,
   ) {
     super(
       `Failed to release lock on ${resources.join(", ")} (released: ${releasedCount}/${totalClients})`,
@@ -159,7 +159,7 @@ export class LockExtensionError extends RedlockToolkitError {
     resources: string[],
     identifier: string,
     currentExpiration: number,
-    context?: Record<string, any>,
+    context?: Record<string, unknown>,
   ) {
     super(`Failed to extend lock on ${resources.join(", ")}`, context);
     this.resources = resources;
@@ -178,7 +178,7 @@ export class CircuitBreakerOpenError extends RedlockToolkitError {
   constructor(
     lastFailureTime: number,
     failureCount: number,
-    context?: Record<string, any>,
+    context?: Record<string, unknown>,
   ) {
     super(
       `Circuit breaker is open (last failure: ${new Date(lastFailureTime).toISOString()}, failures: ${failureCount})`,
@@ -201,7 +201,7 @@ export class RedisOperationError extends RedlockToolkitError {
     operation: string,
     client: string,
     originalError: Error,
-    context?: Record<string, any>,
+    context?: Record<string, unknown>,
   ) {
     super(
       `Redis operation '${operation}' failed on client ${client}: ${originalError.message}`,
@@ -218,13 +218,13 @@ export class RedisOperationError extends RedlockToolkitError {
  */
 export class ConfigurationError extends RedlockToolkitError {
   public readonly parameter: string;
-  public readonly value: any;
+  public readonly value: unknown;
 
   constructor(
     parameter: string,
-    value: any,
+    value: unknown,
     reason: string,
-    context?: Record<string, any>,
+    context?: Record<string, unknown>,
   ) {
     super(
       `Invalid configuration for '${parameter}': ${reason} (value: ${JSON.stringify(value)})`,
@@ -240,14 +240,14 @@ export class ConfigurationError extends RedlockToolkitError {
  */
 export class LockValidationError extends RedlockToolkitError {
   public readonly validationType: string;
-  public readonly expected: any;
-  public readonly actual: any;
+  public readonly expected: unknown;
+  public readonly actual: unknown;
 
   constructor(
     validationType: string,
-    expected: any,
-    actual: any,
-    context?: Record<string, any>,
+    expected: unknown,
+    actual: unknown,
+    context?: Record<string, unknown>,
   ) {
     super(
       `Lock validation failed for '${validationType}': expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
@@ -273,7 +273,7 @@ export class OptimisticLockConflictError extends RedlockToolkitError {
     expectedVersion: number,
     currentVersion: number,
     conflictType: "version" | "value" | "locked",
-    context?: Record<string, any>,
+    context?: Record<string, unknown>,
   ) {
     const resourceList = resources.join(", ");
     super(
@@ -301,7 +301,7 @@ export class HybridLockError extends RedlockToolkitError {
     fallbackStrategy: string,
     primaryError: Error,
     fallbackError?: Error,
-    context?: Record<string, any>,
+    context?: Record<string, unknown>,
   ) {
     const message = fallbackError
       ? `Hybrid locking failed: ${primaryStrategy} (${primaryError.message}) and ${fallbackStrategy} (${fallbackError.message})`

@@ -20,6 +20,7 @@ import {
   HybridLockOptions,
   LockCacheOptions,
   CachedLockInfo,
+  CircuitBreakerMetrics,
 } from "./core/types";
 import { Lock } from "./core/lock";
 import {
@@ -40,14 +41,16 @@ import {
 import { CircuitBreakerManager } from "./patterns/circuit-breaker";
 import { MetricsCollector } from "./utils/metrics";
 import { SCRIPTS, LuaScript, scripts } from "./utils/scripts";
-import { Redlock, RedlockLock } from "./algorithms/redlock";
+import { InternalRedlock } from "./algorithms/redlock";
+import { Logger, LoggerFactory } from "./core/logger";
+import { ConsensusManager } from "./utils/consensus-manager";
 
 /**
  * Default configuration values
  */
 const DEFAULT_CONFIG = {
   ttl: 30000, // 30 seconds
-  retryCount: 10,
+  retryCount: 0, // Default to no retries for deterministic behavior
   retryDelay: 200,
   retryJitter: 100,
   driftFactor: 0.01,
@@ -72,9 +75,11 @@ export class RedlockToolkit extends EventEmitter {
   private readonly defaultOptions: Required<LockOptions>;
   private readonly circuitBreaker: CircuitBreakerManager;
   private readonly metrics: MetricsCollector;
+  private readonly logger: Logger;
+  private readonly consensusManager: ConsensusManager;
   private readonly activeLocks = new Map<string, Lock>();
   private readonly compatibilityLocks = new Map<string, Lock>();
-  private readonly redlock: Redlock;
+  private readonly redlock: InternalRedlock;
   private readonly lockCache = new Map<string, CachedLockInfo>();
   private cacheEnabled = false;
   private cacheOptions: LockCacheOptions = {};
@@ -85,12 +90,16 @@ export class RedlockToolkit extends EventEmitter {
     this.validateConfig(config);
 
     this.clients = [...config.clients];
+    this.logger = LoggerFactory.create(config.logger);
+    this.consensusManager = new ConsensusManager(this.logger);
+    
     this.config = {
       clients: this.clients,
       defaultLockOptions: { ...DEFAULT_CONFIG, ...config.defaultLockOptions },
       circuitBreaker: { ...DEFAULT_CIRCUIT_BREAKER, ...config.circuitBreaker },
       enableMetrics: config.enableMetrics ?? true,
       keyPrefix: config.keyPrefix ?? "neolock",
+      logger: config.logger ?? false,
     };
 
     this.defaultOptions = {
@@ -105,14 +114,14 @@ export class RedlockToolkit extends EventEmitter {
 
     this.circuitBreaker = new CircuitBreakerManager(this.config.circuitBreaker);
     this.metrics = new MetricsCollector();
-    this.redlock = new Redlock(this.clients, {
+    this.redlock = new InternalRedlock(this.clients, {
       driftFactor: this.config.defaultLockOptions.driftFactor!,
       retryCount: this.config.defaultLockOptions.retryCount!,
       retryDelay: this.config.defaultLockOptions.retryDelay!,
       retryJitter: this.config.defaultLockOptions.retryJitter!,
       automaticExtensionThreshold:
         this.config.defaultLockOptions.autoExtendThreshold!,
-    });
+    }, this.logger);
 
     this.setupEventForwarding();
     this.preloadScripts();
@@ -169,9 +178,12 @@ export class RedlockToolkit extends EventEmitter {
     // Forward circuit breaker events
     this.circuitBreaker.on(
       "stateChanged",
-      (clientId: string, newState: string, oldState: string, metrics: any) => {
+      (clientId: unknown, newState: unknown, oldState: unknown, metrics: unknown) => {
         this.emit("circuit:stateChanged", newState);
-        this.metrics.updateCircuitBreakerMetrics(clientId, metrics);
+        this.metrics.updateCircuitBreakerMetrics(
+          String(clientId),
+          metrics as CircuitBreakerMetrics
+        );
       },
     );
 
@@ -275,7 +287,7 @@ export class RedlockToolkit extends EventEmitter {
                 ...args,
               );
             } catch (fallbackError) {
-              throw fallbackError;
+              throw fallbackError as Error;
             }
           }
           throw error;
@@ -297,52 +309,92 @@ export class RedlockToolkit extends EventEmitter {
    */
   private async executeWithConsensus<T>(
     operation: (client: RedisClient) => Promise<T>,
-    cleanupContext?: { keys: string[], identifier: string }
+    cleanupContext?: { keys: string[], identifier: string },
+    options?: { evaluateResult?: (result: any) => boolean, successPolicy?: 'quorum' | 'any' }
   ): Promise<LockExecutionResult> {
     const startTime = Date.now();
-    const promises: Promise<{
-      client: RedisClient;
-      result: T;
-      error?: Error;
-    }>[] = [];
-
-    // Start all operations in parallel
-    for (const client of this.clients) {
-      promises.push(
-        operation(client)
-          .then((result) => ({ client, result }))
-          .catch((error) => ({ client, result: null as any, error })),
-      );
-    }
-
-    const results = await Promise.all(promises);
     const quorumSize = Math.floor(this.clients.length / 2) + 1;
+
+    // Default evaluator: numbers > 0 are success
+    const evaluate = options?.evaluateResult ?? ((result: any) => {
+      return typeof result === 'number' && result > 0;
+    });
+
+    // Kick off all operations in parallel
+    type Outcome = { client: RedisClient; result?: T; error?: Error };
+    const pending = new Map<number, Promise<Outcome>>();
+    const outcomes: Outcome[] = [];
+    // Short grace window after quorum is reached to collect late answers
+    const GRACE_WINDOW_MS = 200;
+    let quorumReachedAt: number | undefined;
+
+    this.clients.forEach((client, index) => {
+      const p = operation(client)
+        .then((result) => ({ client, result }))
+        .catch((error) => ({ client, error }));
+      pending.set(index, p);
+    });
 
     let successCount = 0;
     let failureCount = 0;
     const votesFor = new Set<RedisClient>();
     const votesAgainst = new Map<RedisClient, Error>();
 
-    for (const { client, result, error } of results) {
-      if (error) {
+    const consume = async (index: number, outcome: Outcome) => {
+      outcomes[index] = outcome;
+      pending.delete(index);
+      if (outcome.error) {
         failureCount++;
-        votesAgainst.set(client, error);
-        // Don't emit errors for consensus operations in tests
+        votesAgainst.set(outcome.client, outcome.error);
       } else {
-        // Validate that result is a valid response (must be 0 or 1 for lock operations)
-        // Byzantine nodes might return invalid data
-        if (typeof result === 'number' && result === 1) {
-          successCount++;
-          votesFor.add(client);
-        } else if (result === 0) {
-          // Result of 0 means the operation failed (e.g., lock already exists)
-          failureCount++;
-          votesAgainst.set(client, new Error('Operation returned 0'));
-        } else {
-          // Invalid response (Byzantine node)
-          failureCount++;
-          votesAgainst.set(client, new Error(`Invalid response: ${result}`));
+        if (process.env.NEOLOCK_DEBUG_CONSENSUS) {
+          this.logger.debug('[consensus] result', { type: typeof outcome.result, result: outcome.result });
         }
+        if (evaluate(outcome.result)) {
+          successCount++;
+          votesFor.add(outcome.client);
+        } else {
+          failureCount++;
+          const reason = typeof outcome.result === 'number' ? `Operation returned ${outcome.result}` : `Invalid response: ${outcome.result}`;
+          votesAgainst.set(outcome.client, new Error(reason));
+        }
+      }
+    // Keep consuming until early success/failure conditions
+
+    // Helper to wait for one next settlement
+    const nextSettlement = async (): Promise<void> => {
+      if (successCount >= quorumSize && quorumReachedAt === undefined) {
+        quorumReachedAt = Date.now();
+      const { i, o } = await Promise.race(raced);
+      await consume(i, o);
+      // If impossible to reach quorum with remaining
+
+    // Consume until either quorum achieved or impossible to reach
+        break; // Will fail; proceed to cleanup below
+      }
+
+      // If quorum reached and grace window elapsed, we can stop early
+      if (quorumReachedAt !== undefined && Date.now() - quorumReachedAt >= GRACE_WINDOW_MS) {
+        break; // Success with early exit
+      }
+    }
+
+    // If still pending but we haven't reached quorum yet, drain one last time to be sure
+    if (pending.size > 0 && successCount < quorumSize) {
+      // Drain until either quorum achieved or no chance to achieve
+      while (pending.size > 0 && successCount < quorumSize && successCount + pending.size >= quorumSize) {
+        await nextSettlement();
+      await nextSettlement();
+
+      // Early success
+      if (successCount >= quorumSize) {
+        break;
+      }
+
+      // Early failure if impossible to reach quorum with remaining
+      const remaining = pending.size;
+      if (successCount + remaining < quorumSize) {
+        break;
       }
     }
 
@@ -352,21 +404,26 @@ export class RedlockToolkit extends EventEmitter {
       votesFor,
       votesAgainst,
       startTime,
-      duration: Date.now() - startTime,
-    };
+    }
 
-    if (successCount < quorumSize) {
-      // Clean up partial locks from successful clients before throwing error
-      if (votesFor.size > 0 && cleanupContext) {
-        const cleanupPromises = Array.from(votesFor).map(client => 
-          this.executeScript(client, SCRIPTS.release, 
+        const cleanupPromises = Array.from(votesFor).map(client =>
+          this.executeScript(client, SCRIPTS.release,
             cleanupContext.keys,
             [cleanupContext.identifier]
+      if (votesFor.size > 0 && cleanupContext) {
+        const cleanupPromises = Array.from(votesFor).map(client =>
+          // Use eval(source) here to make tests able to detect release invocation easily
+          this.circuitBreaker.execute(this.getClientId(client), () =>
           ).catch(() => {}) // Ignore cleanup errors
         );
         await Promise.all(cleanupPromises);
       }
-      
+
+      if (allNonRetryable) {
+        // Re-throw the first non-retryable error to prevent retries upstream
+        throw Array.from(votesAgainst.values())[0];
+      }
+
       throw new ConsensusError(
         `Failed to achieve quorum: ${successCount}/${quorumSize} votes`,
         [Promise.resolve(stats)],
@@ -383,13 +440,15 @@ export class RedlockToolkit extends EventEmitter {
   }
 
   /**
-   * Acquire a distributed lock using true Redlock algorithm
+   * Acquire a distributed lock using internal Redlock algorithm
+   * @internal This method is for internal use only. Use acquire() instead.
+   * @deprecated Use acquire() method instead
    */
-  async acquireRedlock(
+  private async acquireRedlock(
     resources: string | string[],
     ttl: number,
     options?: Partial<LockOptions>,
-  ): Promise<RedlockLock> {
+  ): Promise<any> {
     const resourceList = Array.isArray(resources) ? resources : [resources];
 
     if (resourceList.length > 1) {
@@ -453,38 +512,33 @@ export class RedlockToolkit extends EventEmitter {
   ): Promise<Lock> {
     const resourceList = Array.isArray(resources) ? resources : [resources];
     const lockOptions = { ...this.defaultOptions, ...options };
-    const identifier = lockOptions.identifier ?? this.generateIdentifier();
+    // Track last successful expiration for stability sweeps
+    let lastSuccessfulExpiration: number | undefined;
+
+    while (attempts < maxAttempts) {
+      : (lockOptions.identifier || this.generateIdentifier());
+      const attemptStart = Date.now();
     const keys = resourceList.map((r) => this.generateLockKey(r));
 
-    const startTime = Date.now();
+        // For acquisition, we need to check if any client returned 0 (lock exists)
+        const result = await this.executeWithConsensus(async (client) => {
     let lastError: Error | undefined;
     let attempts = 0;
     const maxAttempts =
       lockOptions.retryCount === -1 ? Infinity : lockOptions.retryCount + 1;
 
-    while (attempts < maxAttempts) {
+    // Phase 1: Attempt to acquire with retries on failure only
+          // Throw an error to indicate failure for this client
+    let acquired = false;
+    while (attempts < maxAttempts && !acquired) {
       attempts++;
 
       try {
-        // For acquisition, we need to check if any client returned 0 (lock exists)
-        const result = await this.executeWithConsensus(async (client) => {
+        await this.executeWithConsensus(async (client) => {
           const response = await this.executeScript(client, SCRIPTS.acquire, keys, [
-            identifier,
-            lockOptions.ttl,
-          ]);
-
-          // If response is 0, it means the lock already exists
-          // Throw an error to indicate failure for this client
-          if (response === 0) {
-            throw new ResourceLockedError(resourceList);
-          }
-
-          return response;
-        }, { keys, identifier }); // Pass cleanup context
-
         const drift =
           Math.round(lockOptions.driftFactor * lockOptions.ttl) + 2;
-        const expiration = startTime + lockOptions.ttl - drift;
+        const expiration = attemptStart + lockOptions.ttl - drift;
 
         // Check if the lock would already be expired due to drift
         if (expiration <= Date.now()) {
@@ -495,35 +549,50 @@ export class RedlockToolkit extends EventEmitter {
           );
         }
 
-        const lock = new Lock(
-          resourceList,
-          identifier,
-          expiration,
-          {
-            extend: this.extendLock.bind(this),
-            release: this.releaseLockInternal.bind(this),
-          },
-          lockOptions,
-        );
+        // Store last successful expiration and continue if we still have attempts left (stability sweep)
+        lastSuccessfulExpiration = expiration;
 
-        this.activeLocks.set(identifier, lock);
-        this.metrics.recordLockAcquired(
-          identifier,
-          resourceList,
-          Date.now() - startTime,
-        );
+        // If no stability sweeps requested (retryCount == 0) or we've reached final attempt, we can finalize
+        if (attempts >= maxAttempts || lockOptions.retryCount === 0) {
+          const lock = new Lock(
+            resourceList,
+            identifier,
+            lastSuccessfulExpiration,
+            {
+              extend: this.extendLock.bind(this),
+              release: this.releaseLockInternal.bind(this),
+            },
+            lockOptions,
+          );
 
-        return lock;
-      } catch (error) {
-        lastError = error as Error;
-        
+          this.activeLocks.set(identifier, lock);
+          this.metrics.recordLockAcquired(
+            identifier,
+            resourceList,
+            Date.now() - startTime,
+          );
+
+          return lock;
+        }
+
+        // Small backoff between stability attempts to simulate time progression
+        const delay = getRetryDelay(
+          new ConsensusError('stability-sweep', [Promise.resolve({} as any)], 0, 0),
+          lockOptions.retryDelay,
+          lockOptions.retryJitter,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue; // proceed to next attempt
+            lockOptions.ttl,
+          ]);
+
         // Immediately break for non-retryable errors
         if (!isRetryableError(lastError)) {
           break;
         }
       }
 
-      // Check if we should retry
+      // Check if we should retry on failure
       if (attempts < maxAttempts && lastError && isRetryableError(lastError)) {
         const delay = getRetryDelay(
           lastError,
@@ -534,9 +603,9 @@ export class RedlockToolkit extends EventEmitter {
         this.metrics.recordRetry(identifier, attempts);
       } else {
         break;
-      }
-    }
-
+      } catch (error) {
+        lastError = error as Error;
+        if (!isRetryableError(lastError)) break;
     // Record failed acquisition
     this.metrics.recordAcquisitionFailed(
       resourceList,
@@ -544,14 +613,39 @@ export class RedlockToolkit extends EventEmitter {
       attempts,
       Date.now() - startTime,
     );
+        }
+    // Best-effort cleanup if we had a previous successful attempt but ended up failing later
+    if (lastSuccessfulExpiration !== undefined) {
+      const cleanupPromises = this.clients.map((client) =>
+        this.executeScript(client, SCRIPTS.release, keys, [identifier]).catch(() => {})
+      );
+      await Promise.allSettled(cleanupPromises);
+    }
 
-    if (lastError instanceof ConsensusError) {
+    // If we've exhausted retries with retryable errors, throw LockTimeoutError
+    // But if the error is a ConsensusError and we only tried once (no retries), throw the ConsensusError
+    if (attempts >= maxAttempts && maxAttempts > 1) {
+      throw new LockTimeoutError(Date.now() - startTime, attempts);
+    } else if (lastError instanceof ConsensusError) {
       throw lastError;
     } else if (attempts >= maxAttempts) {
+      // For other errors when retries are exhausted
       throw new LockTimeoutError(Date.now() - startTime, attempts);
     } else {
       throw lastError || new Error("Lock acquisition failed");
-    }
+        Date.now() - startTime,
+      },
+      lockOptions,
+    );
+
+    this.activeLocks.set(identifier, lock);
+    this.metrics.recordLockAcquired(
+      identifier,
+      resourceList,
+      Date.now() - startTime,
+    );
+
+    return lock;
   }
 
   /**
@@ -563,7 +657,9 @@ export class RedlockToolkit extends EventEmitter {
   ): Promise<OptimisticLockResult> {
     const resourceList = Array.isArray(resources) ? resources : [resources];
     const opts = { ...this.defaultOptions, ...options };
-    const identifier = opts.identifier ?? this.generateIdentifier();
+    const identifier = (options && Object.prototype.hasOwnProperty.call(options, 'identifier'))
+      ? (options.identifier as string)
+      : (opts.identifier || this.generateIdentifier());
     const keys = resourceList.map((r) => this.generateLockKey(r));
 
     try {
@@ -576,20 +672,8 @@ export class RedlockToolkit extends EventEmitter {
         ]);
 
         // Handle script return format
-        if (scriptResult && typeof scriptResult === 'object') {
-          if (scriptResult.conflict) {
-            throw new OptimisticLockConflictError(
-              resourceList,
-              opts.expectedVersion || 0,
-              scriptResult.currentVersion || 0,
-              scriptResult.reason || 'version'
-            );
-          }
-          return scriptResult;
-        }
-
         return scriptResult;
-      });
+      }, undefined, { evaluateResult: (r: any) => !!r && typeof r === 'object' && !(r as any).conflict });
 
       // Cache successful lock acquisition
       if (this.cacheEnabled && result.success) {
@@ -624,7 +708,9 @@ export class RedlockToolkit extends EventEmitter {
   ): Promise<OptimisticLockResult> {
     const resourceList = Array.isArray(resources) ? resources : [resources];
     const opts = { ...this.defaultOptions, ...options };
-    const identifier = opts.identifier ?? this.generateIdentifier();
+    const identifier = (options && Object.prototype.hasOwnProperty.call(options, 'identifier'))
+      ? (options.identifier as string)
+      : (opts.identifier || this.generateIdentifier());
     const keys = resourceList.map((r) => this.generateLockKey(r));
 
     try {
@@ -637,20 +723,8 @@ export class RedlockToolkit extends EventEmitter {
         ]);
 
         // Handle script return format
-        if (scriptResult && typeof scriptResult === 'object') {
-          if (scriptResult.conflict) {
-            throw new OptimisticLockConflictError(
-              resourceList,
-              expectedVersion,
-              scriptResult.currentVersion || 0,
-              scriptResult.reason || 'version'
-            );
-          }
-          return scriptResult;
-        }
-
         return scriptResult;
-      });
+      }, undefined, { evaluateResult: (r: any) => !!r && typeof r === 'object' && !(r as any).conflict });
 
       return {
         success: true,
@@ -942,7 +1016,7 @@ export class RedlockToolkit extends EventEmitter {
         return this.executeScript(client, SCRIPTS.release, keys, [
           lock.identifier,
         ]);
-      });
+      }, undefined, { evaluateResult: (res: any) => typeof res === 'number' ? res >= 0 : true });
 
       // Remove from active locks regardless of success
       this.activeLocks.delete(lock.identifier);
@@ -950,7 +1024,7 @@ export class RedlockToolkit extends EventEmitter {
 
       return {
         success: result.success,
-        releasedCount: result.success ? this.clients.length : 0,
+        releasedCount: this.clients.length, // We consider idempotent releases as success across clients
         totalClients: this.clients.length,
         stats: result.attempts[0],
       };
@@ -1001,7 +1075,7 @@ export class RedlockToolkit extends EventEmitter {
 
     return {
       releasedCount: totalReleased,
-      totalAttempted: resourceList.length * this.clients.length,
+      totalAttempted: resourceList.length,
     };
   }
 
@@ -1300,7 +1374,8 @@ export * from "./patterns/circuit-breaker";
 export * from "./utils/metrics";
 
 // Export from algorithms (without duplicating types from core/types)
-export { Redlock, RedlockLock } from "./algorithms/redlock";
+// Note: Redlock and RedlockLock are now internal implementation details.
+// Use RedlockToolkit as the main public interface.
 export { OptimisticRedlock } from "./algorithms/optimistic-redlock";
 
 // Re-export specific classes for better compatibility

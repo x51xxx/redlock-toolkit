@@ -4,7 +4,7 @@
  */
 
 import { Redis as IORedisClient, Cluster as IORedisCluster } from "ioredis";
-import { EventEmitter } from "events";
+import { Logger } from "./logger";
 
 export type RedisClient = IORedisClient | IORedisCluster;
 
@@ -56,6 +56,8 @@ export interface RedlockToolkitConfig {
   enableMetrics?: boolean;
   /** Custom lock key prefix */
   keyPrefix?: string;
+  /** Logger instance or boolean (true for console, false for silent) */
+  logger?: Logger | boolean;
 }
 
 /**
@@ -198,7 +200,7 @@ export interface OptimisticLockOptions extends LockOptions {
   /** Expected version for optimistic locking */
   expectedVersion?: number;
   /** Expected value for compare-and-swap */
-  expectedValue?: any;
+  expectedValue?: unknown;
   /** Conflict resolution strategy */
   conflictResolution?: "fail" | "retry" | "fallback";
   /** Maximum retries for conflict resolution */

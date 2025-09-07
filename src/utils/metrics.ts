@@ -4,7 +4,7 @@
  */
 
 import { EventEmitter } from "events";
-import { LockMetrics, CircuitBreakerMetrics, LockStats } from "../core/types";
+import { LockMetrics, CircuitBreakerMetrics } from "../core/types";
 
 // Re-export types that are used by tests
 export type { CircuitBreakerMetrics } from "../core/types";

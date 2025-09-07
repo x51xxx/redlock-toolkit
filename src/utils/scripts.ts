@@ -485,7 +485,7 @@ export function calculateScriptHash(script: string): string {
  * Validate that pre-computed hashes are correct
  */
 export function validateScriptHashes(): boolean {
-  return Object.entries(SCRIPTS).every(([name, script]) => {
+  return Object.entries(SCRIPTS).every(([, script]) => {
     const computedHash = calculateScriptHash(script.source);
     return computedHash === script.hash;
   });
