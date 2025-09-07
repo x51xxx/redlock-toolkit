@@ -1,0 +1,111 @@
+{
+  "name": "@trishchuk/redlock-toolkit",
+  "version": "0.9.2",
+  "description": "Advanced Redis distributed locking library with Redlock algorithm, Circuit Breaker pattern, automatic extension and optimistic locking support",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "build:watch": "tsc --watch",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:watch": "vitest --watch",
+    "test:coverage": "vitest run --coverage",
+    "test:ui": "vitest --ui",
+    "lint": "eslint src/**/*.ts",
+    "lint:fix": "eslint src/**/*.ts --fix",
+    "format": "prettier --write src/**/*.ts",
+    "prepare": "npm run build",
+    "example": "tsx examples/basic-usage.ts"
+  },
+  "keywords": [
+    "redis",
+    "lock",
+    "distributed",
+    "redlock",
+    "mutex",
+    "semaphore",
+    "concurrency",
+    "typescript",
+    "circuit-breaker",
+    "fault-tolerance",
+    "auto-extend",
+    "consensus",
+    "lua-scripts",
+    "metrics",
+    "prometheus",
+    "distributed-locking",
+    "fault-tolerance",
+    "high-availability"
+  ],
+  "author": "Taras Trishchuk",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/x51xxx/redlock-toolkit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/x51xxx/redlock-toolkit/issues"
+  },
+  "homepage": "https://github.com/x51xxx/redlock-toolkit#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./algorithms/redlock": {
+      "types": "./dist/algorithms/redlock.d.ts",
+      "require": "./dist/algorithms/redlock.js",
+      "import": "./dist/algorithms/redlock.js"
+    },
+    "./algorithms/optimistic-redlock": {
+      "types": "./dist/algorithms/optimistic-redlock.d.ts",
+      "require": "./dist/algorithms/optimistic-redlock.js",
+      "import": "./dist/algorithms/optimistic-redlock.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "typesVersions": {
+    ">=4.5": {
+      "*": ["dist/*"]
+    }
+  },
+  "dependencies": {
+    "ioredis": "^4.0.0 || ^5.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.29.0",
+    "@types/node": "^18.19.112",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.57.1",
+    "eslint-config-prettier": "^9.0.0",
+    "eslint-plugin-prettier": "^5.0.0",
+    "globals": "^16.2.0",
+    "ioredis-mock": "^8.9.0",
+    "prettier": "^3",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.34.1",
+    "vitest": "^3.2.4",
+    "@vitest/coverage-v8": "^3.2.4",
+    "@vitest/ui": "^3.2.4"
+  },
+  "peerDependencies": {
+    "ioredis": "^4.0.0 || ^5.0.0"
+  }
+}

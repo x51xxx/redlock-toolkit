@@ -1,0 +1,60 @@
+# Source files (only distribute built files)
+src/**/*.ts
+!src/**/*.d.ts
+
+# Test files
+tests/
+*.test.ts
+*.spec.ts
+test-*.js
+test-*.ts
+
+# Development and example files
+src/example.ts
+src/example.js
+
+# Documentation source
+docs/
+*.md
+!README.md
+!LICENSE
+
+# Configuration files
+tsconfig.json
+tsconfig.build.json
+.eslintrc*
+.prettierrc*
+vitest.config.ts
+eslint.config.mjs
+
+# Development directories
+.idea/
+.vscode/
+.claude/
+.junie/
+.mcp.json
+prototypes/
+
+# Coverage and logs
+coverage/
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git files
+.git/
+.gitignore
+
+# Node modules (handled by npm automatically, but good to be explicit)
+node_modules/
+
+# Package lock files (users should create their own)
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Build artifacts not for distribution
+*.tsbuildinfo
