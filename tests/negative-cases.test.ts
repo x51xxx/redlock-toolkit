@@ -10,7 +10,7 @@ import RedlockToolkit, { ConfigurationError } from "../src/index";
 import { createMockRedisClients, createTestRedlockToolkitConfig, sleep } from './setup';
 
 describe('RedlockToolkit Negative Cases', () => {
-  let mockClients: any[];
+  let mockClients: ReturnType<typeof createMockRedisClients>;
   let redlockToolkit: RedlockToolkit;
 
   beforeEach(() => {

@@ -5,12 +5,12 @@
  * and atomic operations to prevent race conditions and corruption.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import RedlockToolkit from '../src/index';
 import { createMockRedisClients, createTestRedlockToolkitConfig, sleep } from './setup';
 
 describe('Data Integrity', () => {
-  let mockClients: any[];
+  let mockClients: ReturnType<typeof createMockRedisClients>;
   let neolock: RedlockToolkit;
 
   afterEach(async () => {

@@ -5,13 +5,12 @@
  * and distributed consensus mechanisms under failure conditions.
  */
 
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import RedlockToolkit from '../src/index';
-import { ConsensusError, ResourceLockedError } from '../src/errors';
-import { createMockRedisClients, createTestRedlockToolkitConfig, sleep } from './setup';
+import { createMockRedisClients, createTestRedlockToolkitConfig } from './setup';
 
 describe('Consensus Failures', () => {
-  let mockClients: any[];
+  let mockClients: ReturnType<typeof createMockRedisClients>;
   let neolock: RedlockToolkit;
 
   afterEach(async () => {
@@ -202,9 +201,10 @@ describe('Consensus Failures', () => {
       // Lock validity should be reduced by drift + network time
       const expectedReduction = Math.round(0.01 * 1000) + 2; // drift + 2ms
       const actualValidity = lock.expiration - startTime;
-      
+
       expect(actualValidity).toBeLessThan(1000);
-      expect(actualValidity).toBeLessThanOrEqual(1000 - expectedReduction);
+      // Allow 2ms tolerance for the gap between startTime and the internal lastAttemptStart
+      expect(actualValidity).toBeLessThanOrEqual(1000 - expectedReduction + 2);
     });
 
     it('should fail if drift calculation makes lock invalid', async () => {
@@ -213,7 +213,8 @@ describe('Consensus Failures', () => {
         defaultLockOptions: {
           ttl: 10, // 10ms TTL
           driftFactor: 0.5, // 50% drift (extreme)
-          retryCount: 0
+          retryCount: 0,
+          autoExtendThreshold: 0
         }
       }));
 
@@ -298,20 +299,21 @@ describe('Consensus Failures', () => {
           attemptCount++;
           
           // Nodes fail progressively
+          // With 5 nodes, we need at least 3 for quorum (floor(5/2) + 1 = 3)
           if (attemptCount <= 5) {
-            // First attempt: all succeed
-            return Promise.resolve(1);
-          } else if (attemptCount <= 10) {
-            // Second attempt: some fail
-            return index < 3 ? Promise.resolve(1) : Promise.reject(new Error('Failed'));
-          } else {
-            // Third attempt: more fail
+            // First attempt: only 2 succeed (less than quorum)
             return index < 2 ? Promise.resolve(1) : Promise.reject(new Error('Failed'));
+          } else if (attemptCount <= 10) {
+            // Second attempt: only 1 succeeds
+            return index < 1 ? Promise.resolve(1) : Promise.reject(new Error('Failed'));
+          } else {
+            // Third attempt: all fail
+            return Promise.reject(new Error('Failed'));
           }
         });
       });
 
-      // Should eventually fail as nodes progressively fail
+      // Should fail as there's never quorum
       await expect(neolock.acquire('cascading-failure'))
         .rejects.toThrow();
     });

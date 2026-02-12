@@ -8,7 +8,7 @@ import { createMockRedisClients, createTestRedlockToolkitConfig, sleep } from '.
 import { SCRIPTS } from "../src/utils/scripts";
 
 describe('RedlockToolkit Integration Tests', () => {
-  let mockClients: any[];
+  let mockClients: ReturnType<typeof createMockRedisClients>;
   let neolock: RedlockToolkit;
 
   beforeEach(() => {
@@ -314,10 +314,11 @@ describe('RedlockToolkit Integration Tests', () => {
 
       await neolock.using('auto:extend', async (signal) => {
         expect(signal.aborted).toBe(false);
-        await sleep(250); // Wait longer than initial TTL
+        // Wait long enough for auto-extension to trigger (TTL=200, threshold=50 → fires at ~150ms)
+        await sleep(250);
         expect(signal.aborted).toBe(false);
       }, {
-        ttl: 500,
+        ttl: 200,
         autoExtendThreshold: 50
       });
 
@@ -351,8 +352,8 @@ describe('RedlockToolkit Integration Tests', () => {
 
       try {
         await neolock.using('auto:extend:fail', async (signal) => {
-          // Wait for auto-extension to trigger
-          await sleep(300);
+          // Wait for auto-extension to trigger (TTL=200, threshold=50 → fires at ~150ms)
+          await sleep(250);
 
           // Check if signal was aborted and capture the state
           wasAborted = signal.aborted;
@@ -365,8 +366,8 @@ describe('RedlockToolkit Integration Tests', () => {
           // This should not execute if properly aborted
           await sleep(200);
         }, {
-          ttl: 500,
-          autoExtendThreshold: 30
+          ttl: 200,
+          autoExtendThreshold: 50
         });
 
         // If we get here, the test should fail
@@ -453,21 +454,13 @@ describe('RedlockToolkit Integration Tests', () => {
 
   describe('Administrative Operations', () => {
     it('should get lock status correctly', async () => {
-      // Mock status script to return lock information
+      // Mock status script to return flat array of triples: [key, holder, ttl, ...]
       mockClients[0].evalsha.mockImplementation((script, keyCount, ...args) => {
         if (script === SCRIPTS.status.hash) {
-          return JSON.stringify([
-            {
-              key: 'neolock:resource1',
-              holder: 'lock-123',
-              ttl: 5000
-            },
-            {
-              key: 'neolock:resource2', 
-              holder: null,
-              ttl: -2
-            }
-          ]);
+          return [
+            'neolock:resource1', 'lock-123', 5000,
+            'neolock:resource2', '', -2
+          ];
         }
         return simulateDefaultScript(script, keyCount, ...args);
       });
@@ -484,7 +477,7 @@ describe('RedlockToolkit Integration Tests', () => {
         {
           resource: 'resource2',
           locked: false,
-          holder: null,
+          holder: undefined,
           ttl: undefined
         }
       ]);
@@ -492,8 +485,10 @@ describe('RedlockToolkit Integration Tests', () => {
 
     it('should perform cleanup operations', async () => {
       mockClients.forEach(client => {
+        // Mock scan to return some keys, then cleanupCheck script deletes persistent ones
+        client.scan.mockResolvedValue(['0', ['neolock:a', 'neolock:b', 'neolock:c']]);
         client.evalsha.mockImplementation((script, keyCount, ...args) => {
-          if (script === SCRIPTS.cleanup.hash) {
+          if (script === SCRIPTS.cleanupCheck.hash) {
             return 3; // Cleaned 3 locks per client
           }
           return simulateDefaultScript(script, keyCount, ...args);

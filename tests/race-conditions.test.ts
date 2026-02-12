@@ -9,7 +9,7 @@ import { createMockRedisClients, createTestRedlockToolkitConfig, sleep } from '.
 import { SCRIPT_HASHES } from "../src/utils/scripts";
 
 describe('Race Conditions', () => {
-  let mockClients: any[];
+  let mockClients: ReturnType<typeof createMockRedisClients>;
   let redlockToolkit: RedlockToolkit;
 
   afterEach(async () => {
@@ -268,7 +268,8 @@ describe('Race Conditions', () => {
       redlockToolkit = new RedlockToolkit(createTestRedlockToolkitConfig(mockClients, {
         defaultLockOptions: {
           ttl: 100, // Very short TTL
-          retryCount: 0
+          retryCount: 0,
+          autoExtendThreshold: 0
         }
       }));
     });
@@ -292,11 +293,20 @@ describe('Race Conditions', () => {
     });
 
     it('should handle expiration during routine execution', async () => {
+      // Need auto-extension enabled to detect expiration during routine
+      const toolkit = new RedlockToolkit(createTestRedlockToolkitConfig(mockClients, {
+        defaultLockOptions: {
+          ttl: 100,
+          retryCount: 0,
+          autoExtendThreshold: 50
+        }
+      }));
+
       mockClients.forEach(client => {
         client.evalsha.mockResolvedValueOnce(1); // Acquire
       });
 
-      const lock = await redlockToolkit.acquire('expire-during-routine');
+      const lock = await toolkit.acquire('expire-during-routine');
 
       // Routine that outlasts the lock
       const routine = async (signal: any) => {
@@ -481,7 +491,8 @@ describe('Race Conditions', () => {
       redlockToolkit = new RedlockToolkit(createTestRedlockToolkitConfig(mockClients, {
         defaultLockOptions: {
           ttl: 100,
-          retryCount: 0
+          retryCount: 0,
+          autoExtendThreshold: 0
         }
       }));
     });

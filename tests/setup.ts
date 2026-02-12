@@ -182,6 +182,11 @@ export const createMockRedisClient = () => {
       if (command === 'LOAD') return 'sha1hash';
       return 'OK';
     }),
+
+    // SCAN command for iterative key scanning
+    scan: vi.fn().mockImplementation(() => {
+      return ['0', []]; // Return cursor "0" (done) and empty keys
+    }),
     
     // Utility methods
     flushall: vi.fn().mockImplementation(() => {
@@ -189,6 +194,18 @@ export const createMockRedisClient = () => {
       return 'OK';
     }),
     
+    // Pub/Sub commands
+    publish: vi.fn().mockResolvedValue(0),
+    subscribe: vi.fn().mockResolvedValue(undefined),
+    unsubscribe: vi.fn().mockResolvedValue(undefined),
+    on: vi.fn(),
+    removeListener: vi.fn(),
+    duplicate: vi.fn().mockImplementation(function (this: ReturnType<typeof createMockRedisClient>) {
+      const dup = createMockRedisClient();
+      dup.options = { ...this.options };
+      return dup;
+    }),
+
     disconnect: vi.fn(),
     quit: vi.fn()
   };

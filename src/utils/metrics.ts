@@ -205,11 +205,13 @@ export class MetricsCollector extends EventEmitter {
     {
       resources: string[];
       acquisitionTime: number;
+      ttl: number;
       extensions: number;
     }
   >();
 
   private startTime = Date.now();
+  private evictionTimer?: ReturnType<typeof setInterval>;
 
   /**
    * Record lock acquisition
@@ -218,6 +220,7 @@ export class MetricsCollector extends EventEmitter {
     identifier: string,
     resources: string[],
     acquisitionLatencyMs: number,
+    ttl: number = 30000,
   ): void {
     this.locksAcquired.inc();
     this.activeLocks.inc();
@@ -226,8 +229,11 @@ export class MetricsCollector extends EventEmitter {
     this.activeLocksMap.set(identifier, {
       resources,
       acquisitionTime: Date.now(),
+      ttl,
       extensions: 0,
     });
+
+    this.startEvictionTimer();
 
     this.emit("lockAcquired", {
       identifier,
@@ -242,11 +248,12 @@ export class MetricsCollector extends EventEmitter {
    */
   recordLockReleased(identifier: string, releaseLatencyMs: number): void {
     this.locksReleased.inc();
-    this.activeLocks.dec();
     this.releaseLatency.observe(releaseLatencyMs);
 
     const lockInfo = this.activeLocksMap.get(identifier);
     if (lockInfo) {
+      // Only decrement if the entry still exists (not already evicted)
+      this.activeLocks.dec();
       const duration = Date.now() - lockInfo.acquisitionTime;
       this.lockDuration.observe(duration);
       this.activeLocksMap.delete(identifier);
@@ -478,6 +485,45 @@ export class MetricsCollector extends EventEmitter {
   }
 
   /**
+   * Start periodic eviction of expired entries from activeLocksMap.
+   * Runs at most once (idempotent).
+   */
+  private startEvictionTimer(): void {
+    if (this.evictionTimer) return;
+    this.evictionTimer = setInterval(() => this.evictExpiredLocks(), 10000);
+    // Allow process to exit even if timer is running
+    if (this.evictionTimer && typeof this.evictionTimer === 'object' && 'unref' in this.evictionTimer) {
+      this.evictionTimer.unref();
+    }
+  }
+
+  /**
+   * Remove locks from activeLocksMap that have expired based on
+   * their acquisition time + TTL (with 2x margin for extensions).
+   */
+  private evictExpiredLocks(): void {
+    const now = Date.now();
+    for (const [identifier, info] of this.activeLocksMap) {
+      // Allow generous margin: 2x TTL per extension cycle + base TTL
+      const maxLifetime = info.ttl * (2 + info.extensions);
+      if (now - info.acquisitionTime > maxLifetime) {
+        this.activeLocksMap.delete(identifier);
+        this.activeLocks.dec();
+      }
+    }
+  }
+
+  /**
+   * Stop the eviction timer (for cleanup/shutdown).
+   */
+  stopEviction(): void {
+    if (this.evictionTimer) {
+      clearInterval(this.evictionTimer);
+      this.evictionTimer = undefined;
+    }
+  }
+
+  /**
    * Reset all metrics
    */
   reset(): void {
@@ -500,6 +546,9 @@ export class MetricsCollector extends EventEmitter {
     // Clear maps
     this.circuitBreakerMetrics.clear();
     this.activeLocksMap.clear();
+
+    // Stop eviction timer
+    this.stopEviction();
 
     this.startTime = Date.now();
 

@@ -43,6 +43,16 @@ export interface CircuitBreakerOptions {
 }
 
 /**
+ * Pub/Sub configuration for notification-based waiting
+ */
+export interface PubSubConfig {
+  /** Enable pub/sub waiting for lock acquisition */
+  enabled: boolean;
+  /** User-provided subscriber clients (optional; will use client.duplicate() if not provided) */
+  subscriberClients?: RedisClient[];
+}
+
+/**
  * RedlockToolkit configuration
  */
 export interface RedlockToolkitConfig {
@@ -58,6 +68,8 @@ export interface RedlockToolkitConfig {
   keyPrefix?: string;
   /** Logger instance or boolean (true for console, false for silent) */
   logger?: Logger | boolean;
+  /** Pub/Sub configuration for notification-based waiting */
+  pubSub?: PubSubConfig;
 }
 
 /**
@@ -261,6 +273,134 @@ export interface CachedLockInfo {
   cachedAt: number;
   /** Lock status */
   status: "acquired" | "expired" | "released";
+}
+
+/**
+ * Interface that strategies use to interact with the toolkit.
+ * Prevents strategies from depending on the concrete RedlockToolkit class
+ * and accessing private members via bracket notation.
+ */
+export interface ILockToolkit {
+  /** Default lock options */
+  readonly defaultOptions: Required<LockOptions>;
+  /** Active locks map */
+  readonly activeLocks: Map<string, import("./lock").Lock>;
+  /** Metrics collector */
+  readonly metrics: {
+    recordLockAcquired(identifier: string, resources: string[], latencyMs: number, ttl?: number): void;
+    recordAcquisitionFailed(resources: string[], error: Error, attempts: number, durationMs: number): void;
+    recordRetry(identifier: string, attempt: number): void;
+  };
+  /** Cache manager */
+  readonly cacheManager: {
+    set(identifier: string, resources: string[], ttl: number): void;
+  };
+  /** Generate a prefixed lock key */
+  generateLockKey(resource: string): string;
+  /** Generate unique lock identifier */
+  generateIdentifier(): string;
+  /** Execute Lua script on a single client */
+  executeScript(client: RedisClient, script: import("../utils/scripts").LuaScript, keys: string[], args: (string | number)[]): Promise<unknown>;
+  /** Execute operation across all clients with consensus */
+  executeWithConsensus<T>(
+    operation: (client: RedisClient) => Promise<T>,
+    cleanupContext?: { keys: string[]; identifier: string; script?: import("../utils/scripts").LuaScript; args?: (string | number)[] },
+    options?: { evaluateResult?: (result: unknown) => boolean; successPolicy?: 'quorum' | 'any' },
+  ): Promise<LockExecutionResult>;
+  /** Extend a lock */
+  extendLock(lock: import("./lock").Lock, ttl: number, options?: Partial<LockOptions>): Promise<LockExtensionResult>;
+  /** Release a lock internally */
+  releaseLockInternal(lock: import("./lock").Lock, options?: Partial<LockOptions>): Promise<LockReleaseResult>;
+  /** Emit an event */
+  emit(event: string, ...args: unknown[]): boolean;
+  /** Acquire a lock (pessimistic) */
+  acquire(resources: string | string[], options?: Partial<LockOptions>): Promise<import("./lock").Lock>;
+  /** Acquire an optimistic lock */
+  acquireOptimistic(resources: string | string[], options?: OptimisticLockOptions): Promise<OptimisticLockResult>;
+  /** Create a Lock from an optimistic result */
+  createLockFromOptimistic(resources: string | string[], result: OptimisticLockResult, options: HybridLockOptions): import("./lock").Lock;
+  /** Pub/sub waiter (null if not enabled) */
+  readonly pubSubWaiter: import("../pubsub/pubsub-waiter").PubSubWaiter | null;
+  /** Get a single Redis client for non-consensus read operations */
+  getClientForRead(): RedisClient;
+}
+
+/**
+ * Semaphore configuration options
+ */
+export interface SemaphoreOptions {
+  /** Maximum number of concurrent permit holders */
+  maxPermits: number;
+  /** Time to live for each permit in milliseconds */
+  ttl?: number;
+  /** Maximum number of retry attempts when semaphore is full */
+  retryCount?: number;
+  /** Base delay between retries in milliseconds */
+  retryDelay?: number;
+  /** Maximum jitter to add to retry delay */
+  retryJitter?: number;
+  /** Clock drift factor */
+  driftFactor?: number;
+  /** Threshold for automatic permit extension in milliseconds */
+  autoExtendThreshold?: number;
+  /** Custom permit identifier */
+  identifier?: string;
+}
+
+/**
+ * Semaphore status
+ */
+export interface SemaphoreStatus {
+  /** Resource name */
+  resource: string;
+  /** Number of active permits */
+  activePermits: number;
+  /** Maximum permits */
+  maxPermits: number;
+  /** Details of current holders */
+  holders: Array<{ identifier: string; expiresAt: number }>;
+}
+
+/**
+ * CountDownLatch options
+ */
+export interface CountDownLatchOptions {
+  /** Number of events to count down from */
+  count: number;
+  /** Time to live for the latch in milliseconds (expires if not completed) */
+  ttl?: number;
+  /** Timeout for await in milliseconds */
+  awaitTimeout?: number;
+  /** Polling interval when waiting (if pub/sub not enabled) */
+  pollInterval?: number;
+}
+
+/**
+ * CountDownLatch status
+ */
+export interface CountDownLatchStatus {
+  /** Whether the latch exists */
+  exists: boolean;
+  /** Current remaining count */
+  remainingCount: number;
+  /** Original target count */
+  targetCount: number;
+  /** Whether the latch has completed (count reached 0) */
+  completed: boolean;
+  /** Remaining TTL in milliseconds */
+  ttl?: number;
+}
+
+/**
+ * CountDown result
+ */
+export interface CountDownResult {
+  /** Whether the countdown was successful */
+  success: boolean;
+  /** Remaining count after this countdown */
+  remainingCount: number;
+  /** Whether this countdown caused the latch to complete */
+  justCompleted: boolean;
 }
 
 /**

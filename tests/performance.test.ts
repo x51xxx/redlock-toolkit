@@ -2,12 +2,12 @@
  * Performance and stress tests
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import RedlockToolkit from '../src/index';
 import { createMockRedisClients, createTestRedlockToolkitConfig, sleep } from './setup';
 
 describe('Performance Tests', () => {
-  let mockClients: any[];
+  let mockClients: ReturnType<typeof createMockRedisClients>;
   let neolock: RedlockToolkit;
 
   beforeEach(() => {

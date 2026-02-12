@@ -277,7 +277,7 @@ export class OptimisticRedlock extends Redlock {
       const versionMap = new Map<string, number>();
       for (const result of validResults) {
         if (result) {
-          const key = `${result.value}:${result.version}`;
+          const key = JSON.stringify([result.value, result.version]);
           versionMap.set(key, (versionMap.get(key) || 0) + 1);
         }
       }
@@ -287,10 +287,10 @@ export class OptimisticRedlock extends Redlock {
 
       for (const [key, count] of versionMap) {
         if (count >= quorum && count > maxCount) {
-          const [value, version] = key.split(":");
+          const [value, version] = JSON.parse(key) as [string, number];
           consensusResult = {
             value,
-            version: parseInt(version, 10),
+            version,
           };
           maxCount = count;
         }

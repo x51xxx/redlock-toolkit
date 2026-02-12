@@ -9,29 +9,24 @@ import {
   RedisClient,
   RedlockToolkitConfig,
   LockOptions,
-  LockStats,
   LockExecutionResult,
   LockReleaseResult,
   LockExtensionResult,
   LockSignal,
-  LockEvents,
   OptimisticLockOptions,
   OptimisticLockResult,
   HybridLockOptions,
   LockCacheOptions,
-  CachedLockInfo,
   CircuitBreakerMetrics,
+  ILockToolkit,
 } from "./core/types";
 import { Lock } from "./core/lock";
 import {
-  RedlockToolkitError,
   ResourceLockedError,
   ConsensusError,
   LockTimeoutError,
-  LockExpiredError,
   LockExtensionError,
   ConfigurationError,
-  CircuitBreakerOpenError,
   RedisOperationError,
   OptimisticLockConflictError,
   HybridLockError,
@@ -40,10 +35,11 @@ import {
 } from "./core/errors";
 import { CircuitBreakerManager } from "./patterns/circuit-breaker";
 import { MetricsCollector } from "./utils/metrics";
-import { SCRIPTS, LuaScript, scripts } from "./utils/scripts";
-import { InternalRedlock } from "./algorithms/redlock";
+import { SCRIPTS, LuaScript } from "./utils/scripts";
+
 import { Logger, LoggerFactory } from "./core/logger";
 import { ConsensusManager } from "./utils/consensus-manager";
+import { CacheManager } from "./managers/cache";
 
 /**
  * Default configuration values
@@ -66,23 +62,39 @@ const DEFAULT_CIRCUIT_BREAKER = {
   operationTimeout: 5000,
 };
 
+import { PessimisticLockStrategy } from "./strategies/pessimistic-strategy";
+import { OptimisticLockStrategy } from "./strategies/optimistic-strategy";
+import { HybridLockStrategy } from "./strategies/hybrid-strategy";
+import { PubSubManager } from "./pubsub/pubsub-manager";
+import { PubSubWaiter } from "./pubsub/pubsub-waiter";
+import { SemaphoreStrategy } from "./strategies/semaphore-strategy";
+import { CountDownLatchStrategy } from "./strategies/countdown-latch-strategy";
+import { SemaphorePermit } from "./primitives/semaphore";
+import { CountDownLatch } from "./primitives/countdown-latch";
+import { SemaphoreOptions, SemaphoreStatus, CountDownLatchOptions, CountDownLatchStatus } from "./core/types";
+
 /**
  * Main RedlockToolkit class implementing advanced distributed locking
  */
-export class RedlockToolkit extends EventEmitter {
+export class RedlockToolkit extends EventEmitter implements ILockToolkit {
   private readonly clients: RedisClient[];
   private readonly config: Required<RedlockToolkitConfig>;
-  private readonly defaultOptions: Required<LockOptions>;
-  private readonly circuitBreaker: CircuitBreakerManager;
-  private readonly metrics: MetricsCollector;
+  readonly defaultOptions: Required<LockOptions>;
+  readonly circuitBreaker: CircuitBreakerManager;
+  readonly metrics: MetricsCollector;
   private readonly logger: Logger;
   private readonly consensusManager: ConsensusManager;
-  private readonly activeLocks = new Map<string, Lock>();
-  private readonly compatibilityLocks = new Map<string, Lock>();
-  private readonly redlock: InternalRedlock;
-  private readonly lockCache = new Map<string, CachedLockInfo>();
-  private cacheEnabled = false;
-  private cacheOptions: LockCacheOptions = {};
+  readonly cacheManager: CacheManager;
+  private readonly pessimisticStrategy: PessimisticLockStrategy;
+  private readonly optimisticStrategy: OptimisticLockStrategy;
+  private readonly hybridStrategy: HybridLockStrategy;
+  readonly activeLocks = new Map<string, Lock>();
+  readonly compatibilityLocks = new Map<string, Lock>();
+  private readonly pubSubManager: PubSubManager | null = null;
+  readonly pubSubWaiter: PubSubWaiter | null = null;
+  private readonly semaphoreStrategy: SemaphoreStrategy;
+  private readonly countDownLatchStrategy: CountDownLatchStrategy;
+  readonly activeSemaphores = new Map<string, SemaphorePermit>();
 
   constructor(config: RedlockToolkitConfig) {
     super();
@@ -92,6 +104,10 @@ export class RedlockToolkit extends EventEmitter {
     this.clients = [...config.clients];
     this.logger = LoggerFactory.create(config.logger);
     this.consensusManager = new ConsensusManager(this.logger);
+    this.cacheManager = new CacheManager();
+    this.pessimisticStrategy = new PessimisticLockStrategy(this);
+    this.optimisticStrategy = new OptimisticLockStrategy(this);
+    this.hybridStrategy = new HybridLockStrategy(this);
     
     this.config = {
       clients: this.clients,
@@ -100,6 +116,7 @@ export class RedlockToolkit extends EventEmitter {
       enableMetrics: config.enableMetrics ?? true,
       keyPrefix: config.keyPrefix ?? "neolock",
       logger: config.logger ?? false,
+      pubSub: config.pubSub ?? { enabled: false },
     };
 
     this.defaultOptions = {
@@ -114,14 +131,27 @@ export class RedlockToolkit extends EventEmitter {
 
     this.circuitBreaker = new CircuitBreakerManager(this.config.circuitBreaker);
     this.metrics = new MetricsCollector();
-    this.redlock = new InternalRedlock(this.clients, {
-      driftFactor: this.config.defaultLockOptions.driftFactor!,
-      retryCount: this.config.defaultLockOptions.retryCount!,
-      retryDelay: this.config.defaultLockOptions.retryDelay!,
-      retryJitter: this.config.defaultLockOptions.retryJitter!,
-      automaticExtensionThreshold:
-        this.config.defaultLockOptions.autoExtendThreshold!,
-    }, this.logger);
+
+    // Initialize pub/sub if enabled
+    if (config.pubSub?.enabled) {
+      this.pubSubManager = new PubSubManager({
+        clients: this.clients,
+        subscriberClients: config.pubSub.subscriberClients,
+        keyPrefix: this.config.keyPrefix as string,
+        logger: this.logger,
+      });
+      this.pubSubWaiter = new PubSubWaiter(
+        this.pubSubManager,
+        this.config.keyPrefix as string,
+      );
+    }
+
+    this.semaphoreStrategy = new SemaphoreStrategy(this);
+    this.countDownLatchStrategy = new CountDownLatchStrategy(
+      this,
+      this.pubSubManager,
+      this.config.keyPrefix as string,
+    );
 
     this.setupEventForwarding();
     this.preloadScripts();
@@ -167,6 +197,17 @@ export class RedlockToolkit extends EventEmitter {
         "driftFactor",
         config.defaultLockOptions.driftFactor,
         "Must be between 0 and 1",
+      );
+    }
+
+    // Validate autoExtendThreshold vs TTL compatibility
+    const effectiveTtl = config.defaultLockOptions?.ttl ?? DEFAULT_CONFIG.ttl;
+    const effectiveThreshold = config.defaultLockOptions?.autoExtendThreshold ?? DEFAULT_CONFIG.autoExtendThreshold;
+    if (effectiveThreshold > 0 && effectiveThreshold >= effectiveTtl) {
+      throw new ConfigurationError(
+        "autoExtendThreshold",
+        effectiveThreshold,
+        `Must be less than TTL (${effectiveTtl}ms). Auto-extension threshold cannot exceed lock TTL.`,
       );
     }
   }
@@ -239,29 +280,36 @@ export class RedlockToolkit extends EventEmitter {
   /**
    * Generate unique client identifier
    */
-  private getClientId(client: RedisClient): string {
+  public getClientId(client: RedisClient): string {
     const options = client.options as any;
     return `${options?.host || "localhost"}:${options?.port || 6379}`;
   }
 
   /**
+   * Get a single Redis client for non-consensus read operations
+   */
+  public getClientForRead(): RedisClient {
+    return this.clients[0];
+  }
+
+  /**
    * Generate lock key
    */
-  private generateLockKey(resource: string): string {
+  public generateLockKey(resource: string): string {
     return `${this.config.keyPrefix}:${resource}`;
   }
 
   /**
    * Generate unique lock identifier
    */
-  private generateIdentifier(): string {
+  public generateIdentifier(): string {
     return randomBytes(16).toString("hex");
   }
 
   /**
    * Execute Lua script on client with fallback
    */
-  private async executeScript(
+  public async executeScript(
     client: RedisClient,
     script: LuaScript,
     keys: string[],
@@ -303,206 +351,51 @@ export class RedlockToolkit extends EventEmitter {
     }
   }
 
-
   /**
-   * Execute operation on all clients with consensus
+   * Execute operation on all clients with consensus and cleanup.
    */
-  private async executeWithConsensus<T>(
+  public async executeWithConsensus<T>(
     operation: (client: RedisClient) => Promise<T>,
-    cleanupContext?: { keys: string[], identifier: string },
+    cleanupContext?: { keys: string[], identifier: string, script?: LuaScript, args?: (string | number)[] },
     options?: { evaluateResult?: (result: any) => boolean, successPolicy?: 'quorum' | 'any' }
   ): Promise<LockExecutionResult> {
-    const startTime = Date.now();
-    const quorumSize = Math.floor(this.clients.length / 2) + 1;
+    try {
+      const result = await this.consensusManager.execute(
+        this.clients,
+        operation,
+        options
+      );
 
-    // Default evaluator: numbers > 0 are success
-    const evaluate = options?.evaluateResult ?? ((result: any) => {
-      return typeof result === 'number' && result > 0;
-    });
-
-    // Kick off all operations in parallel
-    type Outcome = { client: RedisClient; result?: T; error?: Error };
-    const pending = new Map<number, Promise<Outcome>>();
-    const outcomes: Outcome[] = [];
-    this.clients.forEach((client, index) => {
-      const p = operation(client)
-        .then((result) => ({ client, result }))
-        .catch((error) => ({ client, error }));
-      pending.set(index, p);
-    });
-
-    let successCount = 0;
-    let failureCount = 0;
-    const votesFor = new Set<RedisClient>();
-    const votesAgainst = new Map<RedisClient, Error>();
-
-    const consume = async (index: number, outcome: Outcome) => {
-      outcomes[index] = outcome;
-      pending.delete(index);
-      if (outcome.error) {
-        failureCount++;
-        votesAgainst.set(outcome.client, outcome.error);
-      } else {
-        if (process.env.NEOLOCK_DEBUG_CONSENSUS) {
-          // eslint-disable-next-line no-console
-          console.log('[consensus] result:', typeof outcome.result, outcome.result);
-        }
-        if (evaluate(outcome.result)) {
-          successCount++;
-          votesFor.add(outcome.client);
-        } else {
-          failureCount++;
-          const reason = typeof outcome.result === 'number' ? `Operation returned ${outcome.result}` : `Invalid response: ${outcome.result}`;
-          votesAgainst.set(outcome.client, new Error(reason));
+      return {
+        attempts: result.attempts,
+        startTime: result.startTime,
+        success: result.success,
+      };
+    } catch (error) {
+      if (error instanceof ConsensusError && cleanupContext) {
+        const stats = await error.attempts[0];
+        const votesFor = stats.votesFor;
+        if (votesFor.size > 0) {
+          const cleanupScript = cleanupContext.script ?? SCRIPTS.release;
+          const cleanupArgs = cleanupContext.args ?? [cleanupContext.identifier];
+          const cleanupPromises = Array.from(votesFor).map(client =>
+            this.circuitBreaker.execute(this.getClientId(client), () =>
+              client.eval(
+                cleanupScript.source,
+                cleanupContext.keys.length,
+                ...cleanupContext.keys,
+                ...cleanupArgs
+              )
+            ).catch((err) => {
+              this.logger.warn("Consensus cleanup failed", { clientId: this.getClientId(client), error: String(err) });
+            })
+          );
+          await Promise.all(cleanupPromises);
         }
       }
-    };
-
-    // Helper to wait for one next settlement
-    const nextSettlement = async (): Promise<void> => {
-      const entries = Array.from(pending.entries());
-      if (entries.length === 0) return;
-      const raced = entries.map(([i, p]) => p.then((o) => ({ i, o })));
-      const { i, o } = await Promise.race(raced);
-      await consume(i, o);
-    };
-
-    // Consume until either quorum achieved or impossible to reach
-    while (pending.size > 0) {
-      await nextSettlement();
-
-      // Early success
-      if (successCount >= quorumSize) {
-        break;
-      }
-
-      // Early failure if impossible to reach quorum with remaining
-      const remaining = pending.size;
-      if (successCount + remaining < quorumSize) {
-        break;
-      }
+      // Re-throw the original error
+      throw error;
     }
-
-    const stats: LockStats = {
-      totalClients: this.clients.length,
-      quorumSize,
-      votesFor,
-      votesAgainst,
-      startTime,
-      duration: Date.now() - startTime,
-    };
-
-    if (process.env.NEOLOCK_DEBUG_CONSENSUS) {
-      // eslint-disable-next-line no-console
-      console.log('[consensus] totals:', { clients: this.clients.length, quorumSize, successCount, failureCount });
-    }
-
-    const succeeded = options?.successPolicy === 'any' ? successCount > 0 : successCount >= quorumSize;
-
-    if (!succeeded) {
-      // Determine if all failures are non-retryable (e.g., configuration errors)
-      const allNonRetryable = votesFor.size === 0 && Array.from(votesAgainst.values()).every(err =>
-        err instanceof ConfigurationError || err instanceof CircuitBreakerOpenError
-      );
-
-      // Clean up partial locks from successful clients before throwing error
-      if (votesFor.size > 0 && cleanupContext) {
-        const cleanupPromises = Array.from(votesFor).map(client =>
-          // Use eval(source) here to make tests able to detect release invocation easily
-          this.circuitBreaker.execute(this.getClientId(client), () =>
-            client.eval(
-              SCRIPTS.release.source,
-              cleanupContext.keys.length,
-              ...cleanupContext.keys,
-              cleanupContext.identifier
-            )
-          ).catch(() => {}) // Ignore cleanup errors
-        );
-        await Promise.all(cleanupPromises);
-      }
-
-      if (allNonRetryable) {
-        // Re-throw the first non-retryable error to prevent retries upstream
-        throw Array.from(votesAgainst.values())[0];
-      }
-
-      throw new ConsensusError(
-        `Failed to achieve quorum: ${successCount}/${quorumSize} votes`,
-        [Promise.resolve(stats)],
-        quorumSize,
-        successCount,
-      );
-    }
-
-    return {
-      attempts: [Promise.resolve(stats)],
-      startTime,
-      success: true,
-    };
-  }
-
-  /**
-   * Acquire a distributed lock using internal Redlock algorithm
-   * @internal This method is for internal use only. Use acquire() instead.
-   * @deprecated Use acquire() method instead
-   */
-  private async acquireRedlock(
-    resources: string | string[],
-    ttl: number,
-    options?: Partial<LockOptions>,
-  ): Promise<any> {
-    const resourceList = Array.isArray(resources) ? resources : [resources];
-
-    if (resourceList.length > 1) {
-      throw new Error(
-        "Redlock currently supports only single resource locking. Use acquire() for multi-resource locks.",
-      );
-    }
-
-    const redlockOptions = {
-      driftFactor: options?.driftFactor ?? this.defaultOptions.driftFactor,
-      retryCount: options?.retryCount ?? this.defaultOptions.retryCount,
-      retryDelay: options?.retryDelay ?? this.defaultOptions.retryDelay,
-      retryJitter: options?.retryJitter ?? this.defaultOptions.retryJitter,
-      automaticExtensionThreshold:
-        options?.autoExtendThreshold ?? this.defaultOptions.autoExtendThreshold,
-    };
-
-    return await this.redlock.acquire(resourceList[0], ttl, redlockOptions);
-  }
-
-  /**
-   * Execute function with Redlock and native AbortController
-   */
-  async usingRedlock<T>(
-    resources: string | string[],
-    ttl: number,
-    routine: (signal: AbortSignal) => Promise<T>,
-    options?: Partial<LockOptions>,
-  ): Promise<T> {
-    const resourceList = Array.isArray(resources) ? resources : [resources];
-
-    if (resourceList.length > 1) {
-      throw new Error(
-        "Redlock currently supports only single resource locking",
-      );
-    }
-
-    const redlockOptions = {
-      driftFactor: options?.driftFactor ?? this.defaultOptions.driftFactor,
-      retryCount: options?.retryCount ?? this.defaultOptions.retryCount,
-      retryDelay: options?.retryDelay ?? this.defaultOptions.retryDelay,
-      retryJitter: options?.retryJitter ?? this.defaultOptions.retryJitter,
-      automaticExtensionThreshold:
-        options?.autoExtendThreshold ?? this.defaultOptions.autoExtendThreshold,
-    };
-
-    return await this.redlock.using(
-      resourceList[0],
-      ttl,
-      routine,
-      redlockOptions,
-    );
   }
 
   /**
@@ -513,158 +406,22 @@ export class RedlockToolkit extends EventEmitter {
     options?: Partial<LockOptions>,
   ): Promise<Lock> {
     const resourceList = Array.isArray(resources) ? resources : [resources];
-    const lockOptions = { ...this.defaultOptions, ...options };
-    // If caller provided identifier explicitly (even empty string), respect it; otherwise generate one
-    const identifier = (options && Object.prototype.hasOwnProperty.call(options, 'identifier'))
-      ? (options.identifier as string)
-      : (lockOptions.identifier || this.generateIdentifier());
-    const keys = resourceList.map((r) => this.generateLockKey(r));
+    
+    const hasCustomIdentifier = options && Object.prototype.hasOwnProperty.call(options, 'identifier');
+    
+    const lockOptions: Required<LockOptions> = { 
+      ...this.defaultOptions, 
+      ...options,
+      identifier: '', // Placeholder, will be overwritten
+    };
 
-    const startTime = Date.now();
-    let lastError: Error | undefined;
-    let attempts = 0;
-    const maxAttempts =
-      lockOptions.retryCount === -1 ? Infinity : lockOptions.retryCount + 1;
-
-    // Phase 1: Attempt to acquire with retries on failure only
-    let acquired = false;
-    while (attempts < maxAttempts && !acquired) {
-      attempts++;
-
-      try {
-        await this.executeWithConsensus(async (client) => {
-          const response = await this.executeScript(client, SCRIPTS.acquire, keys, [
-            identifier,
-            lockOptions.ttl,
-          ]);
-
-          // If response is 0, it means the lock already exists
-          if (response === 0) {
-            throw new ResourceLockedError(resourceList);
-          }
-
-          return response;
-        }, { keys, identifier }); // Pass cleanup context
-
-        acquired = true;
-      } catch (error) {
-        lastError = error as Error;
-        if (!isRetryableError(lastError)) break;
-        if (attempts < maxAttempts) {
-          const delay = getRetryDelay(
-            lastError,
-            lockOptions.retryDelay,
-            lockOptions.retryJitter,
-          );
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          this.metrics.recordRetry(identifier, attempts);
-        }
-      }
+    if (hasCustomIdentifier) {
+      lockOptions.identifier = options.identifier!;
+    } else {
+      lockOptions.identifier = this.generateIdentifier();
     }
 
-    if (!acquired) {
-      // Record failed acquisition
-      this.metrics.recordAcquisitionFailed(
-        resourceList,
-        lastError || new Error("Unknown error"),
-        attempts,
-        Date.now() - startTime,
-      );
-
-      if (attempts >= maxAttempts && maxAttempts > 1) {
-        throw new LockTimeoutError(Date.now() - startTime, attempts);
-      } else if (lastError instanceof ConsensusError) {
-        throw lastError;
-      } else if (!lastError || isRetryableError(lastError)) {
-        throw new LockTimeoutError(Date.now() - startTime, attempts);
-      } else {
-        throw lastError;
-      }
-    }
-
-    // Compute expiration based on initial start time (matches expected semantics in tests)
-    const drift = Math.round(lockOptions.driftFactor * lockOptions.ttl) + 2;
-    const expiration = startTime + lockOptions.ttl - drift;
-
-    // If drift makes it invalid already, treat as timeout
-    if (expiration <= Date.now()) {
-      throw new LockTimeoutError(lockOptions.ttl, attempts, { reason: 'Lock would be expired due to clock drift', resources: resourceList });
-    }
-
-    // Phase 2: Optional stability verification sweeps (read-only)
-    if (lockOptions.retryCount > 0) {
-      for (let i = 0; i < lockOptions.retryCount; i++) {
-        const delay = getRetryDelay(
-          new ConsensusError('stability-check', [Promise.resolve({} as any)], 0, 0),
-          lockOptions.retryDelay,
-          lockOptions.retryJitter,
-        );
-        await new Promise((resolve) => setTimeout(resolve, delay));
-
-        try {
-          await this.executeWithConsensus(async (client) => {
-            // Use status script (read-only) to verify lock holder on each client
-            const result = await this.executeScript(client, SCRIPTS.status, keys, []);
-            return result;
-          }, { keys, identifier }, {
-            evaluateResult: (res: any) => {
-              // Accept numeric success (for mocks) or validate holder matches identifier
-              if (typeof res === 'number') return res > 0;
-              try {
-                const data = typeof res === 'string' ? JSON.parse(res) : res;
-                if (!Array.isArray(data)) return false;
-                // All keys on that client must be held by our identifier if present
-                return data.every((item: any) => item && (item.holder === null || item.holder === identifier));
-              } catch {
-                return false;
-              }
-            }
-          });
-        } catch (error) {
-          // Cleanup already attempted inside executeWithConsensus; throw failure
-          lastError = error as Error;
-          // Record failed stabilization
-          this.metrics.recordAcquisitionFailed(
-            resourceList,
-            lastError,
-            attempts + i,
-            Date.now() - startTime,
-          );
-
-          // Best-effort global cleanup (in case some clients still hold it)
-          const cleanupPromises = this.clients.map((client) =>
-            this.executeScript(client, SCRIPTS.release, keys, [identifier]).catch(() => {})
-          );
-          await Promise.allSettled(cleanupPromises);
-
-          if (lockOptions.retryCount > 0) {
-            throw new LockTimeoutError(Date.now() - startTime, attempts + i + 1);
-          }
-          throw lastError;
-        }
-      }
-    }
-
-    // Create and register lock after passing stability checks
-    const lock = new Lock(
-      resourceList,
-      identifier,
-      expiration,
-      {
-        extend: this.extendLock.bind(this),
-        release: this.releaseLockInternal.bind(this),
-      },
-      lockOptions,
-    );
-
-    this.activeLocks.set(identifier, lock);
-    this.metrics.recordLockAcquired(
-      identifier,
-      resourceList,
-      Date.now() - startTime,
-    );
-
-    return lock;
+    return this.pessimisticStrategy.acquire(resourceList, lockOptions);
   }
 
   /**
@@ -675,46 +432,7 @@ export class RedlockToolkit extends EventEmitter {
     options: OptimisticLockOptions = {},
   ): Promise<OptimisticLockResult> {
     const resourceList = Array.isArray(resources) ? resources : [resources];
-    const opts = { ...this.defaultOptions, ...options };
-    const identifier = (options && Object.prototype.hasOwnProperty.call(options, 'identifier'))
-      ? (options.identifier as string)
-      : (opts.identifier || this.generateIdentifier());
-    const keys = resourceList.map((r) => this.generateLockKey(r));
-
-    try {
-      const result = await this.executeWithConsensus(async (client) => {
-        const scriptResult = await this.executeScript(client, SCRIPTS.optimisticAcquire, keys, [
-          identifier,
-          opts.ttl,
-          opts.expectedVersion?.toString() || '',
-          opts.expectedValue ? JSON.stringify(opts.expectedValue) : '',
-        ]);
-
-        // Handle script return format
-        return scriptResult;
-      }, undefined, { evaluateResult: (r: any) => !!r && typeof r === 'object' && !(r as any).conflict });
-
-      // Cache successful lock acquisition
-      if (this.cacheEnabled && result.success) {
-        this.cacheLock(identifier, resourceList, opts.ttl);
-      }
-
-      return {
-        success: true,
-        currentVersion: (result as any).newVersion,
-        retries: 0,
-      };
-    } catch (error) {
-      if (error instanceof OptimisticLockConflictError) {
-        this.emit("lock:conflict", resourceList, error.expectedVersion, error.currentVersion);
-        return {
-          success: false,
-          conflict: true,
-          currentVersion: error.currentVersion,
-        };
-      }
-      throw error;
-    }
+    return this.optimisticStrategy.acquire(resourceList, options);
   }
 
   /**
@@ -726,41 +444,7 @@ export class RedlockToolkit extends EventEmitter {
     options: OptimisticLockOptions = {},
   ): Promise<OptimisticLockResult> {
     const resourceList = Array.isArray(resources) ? resources : [resources];
-    const opts = { ...this.defaultOptions, ...options };
-    const identifier = (options && Object.prototype.hasOwnProperty.call(options, 'identifier'))
-      ? (options.identifier as string)
-      : (opts.identifier || this.generateIdentifier());
-    const keys = resourceList.map((r) => this.generateLockKey(r));
-
-    try {
-      const result = await this.executeWithConsensus(async (client) => {
-        const scriptResult = await this.executeScript(client, SCRIPTS.optimisticUpdate, keys, [
-          identifier,
-          opts.ttl,
-          expectedVersion.toString(),
-          opts.expectedValue ? JSON.stringify(opts.expectedValue) : '',
-        ]);
-
-        // Handle script return format
-        return scriptResult;
-      }, undefined, { evaluateResult: (r: any) => !!r && typeof r === 'object' && !(r as any).conflict });
-
-      return {
-        success: true,
-        currentVersion: (result as any).newVersion,
-        retries: 0,
-      };
-    } catch (error) {
-      if (error instanceof OptimisticLockConflictError) {
-        this.emit("lock:conflict", resourceList, error.expectedVersion, error.currentVersion);
-        return {
-          success: false,
-          conflict: true,
-          currentVersion: error.currentVersion,
-        };
-      }
-      throw error;
-    }
+    return this.optimisticStrategy.update(resourceList, expectedVersion, options);
   }
 
   /**
@@ -771,157 +455,34 @@ export class RedlockToolkit extends EventEmitter {
     options: HybridLockOptions = {},
   ): Promise<Lock> {
     const resourceList = Array.isArray(resources) ? resources : [resources];
-    const opts = { ...this.defaultOptions, ...options };
-    const primaryStrategy = opts.primaryStrategy || 'pessimistic';
-    const fallbackStrategy = opts.fallbackStrategy || 'optimistic';
-
-    try {
-      // Try primary strategy
-      if (primaryStrategy === 'pessimistic' || primaryStrategy === 'adaptive') {
-        return await this.acquire(resources, opts);
-      } else if (primaryStrategy === 'optimistic') {
-        const result = await this.acquireOptimistic(resources, opts);
-        if (result.success) {
-          // Convert optimistic result to Lock object
-          return this.createLockFromOptimistic(resources, result, opts);
-        } else {
-          throw new OptimisticLockConflictError(
-            resourceList,
-            (opts as any).expectedVersion || 0,
-            result.currentVersion || 0,
-            'version'
-          );
-        }
-      }
-    } catch (primaryError) {
-      // Try fallback strategy
-      try {
-        if (fallbackStrategy === 'pessimistic') {
-          return await this.acquire(resources, opts);
-        } else if (fallbackStrategy === 'optimistic') {
-          const result = await this.acquireOptimistic(resources, opts);
-          if (result.success) {
-            return this.createLockFromOptimistic(resources, result, opts);
-          }
-        }
-        throw primaryError; // Re-throw if fallback also fails
-      } catch (fallbackError) {
-        throw new HybridLockError(
-          primaryStrategy,
-          fallbackStrategy,
-          primaryError as Error,
-          fallbackError as Error
-        );
-      }
-    }
-
-    throw new Error("Hybrid locking failed - no strategy succeeded");
+    return this.hybridStrategy.acquire(resourceList, options);
   }
 
   /**
    * Enable lock caching
    */
   enableCache(options: LockCacheOptions = {}): void {
-    this.cacheEnabled = true;
-    this.cacheOptions = {
-      ttl: 300000, // 5 minutes default
-      maxSize: 10000,
-      strategy: 'lru',
-      negativeCaching: false,
-      ...options,
-    };
+    this.cacheManager.enable(options);
   }
 
   /**
    * Disable lock caching
    */
   disableCache(): void {
-    this.cacheEnabled = false;
-    this.lockCache.clear();
-  }
-
-  /**
-   * Cache a lock for performance
-   */
-  private cacheLock(identifier: string, resources: string[], ttl: number): void {
-    if (!this.cacheEnabled) return;
-
-    const cacheKey = resources.join(':');
-    const expiration = Date.now() + ttl;
-
-    // Implement LRU eviction if cache is full
-    if (this.lockCache.size >= (this.cacheOptions.maxSize || 10000)) {
-      this.evictCache();
-    }
-
-    this.lockCache.set(cacheKey, {
-      identifier,
-      expiration,
-      cachedAt: Date.now(),
-      status: 'acquired',
-    });
-  }
-
-  /**
-   * Check cache for lock status
-   */
-  private getCachedLock(resources: string[]): CachedLockInfo | null {
-    if (!this.cacheEnabled) return null;
-
-    const cacheKey = resources.join(':');
-    const cached = this.lockCache.get(cacheKey);
-
-    if (!cached) return null;
-
-    // Check if cache entry is expired
-    if (Date.now() > cached.expiration) {
-      this.lockCache.delete(cacheKey);
-      return null;
-    }
-
-    return cached;
-  }
-
-  /**
-   * Evict cache entries based on strategy
-   */
-  private evictCache(): void {
-    if (this.cacheOptions.strategy === 'lru') {
-      // Simple LRU: remove oldest entries
-      const entries = Array.from(this.lockCache.entries());
-      entries.sort((a, b) => a[1].cachedAt - b[1].cachedAt);
-
-      const toRemove = Math.floor(this.lockCache.size * 0.1); // Remove 10%
-      for (let i = 0; i < toRemove; i++) {
-        this.lockCache.delete(entries[i][0]);
-      }
-    } else {
-      // Simple random eviction
-      const keys = Array.from(this.lockCache.keys());
-      const toRemove = Math.floor(keys.length * 0.1);
-      for (let i = 0; i < toRemove; i++) {
-        const randomIndex = Math.floor(Math.random() * keys.length);
-        this.lockCache.delete(keys[randomIndex]);
-        keys.splice(randomIndex, 1);
-      }
-    }
+    this.cacheManager.disable();
   }
 
   /**
    * Get cache statistics
    */
   getCacheStats(): { size: number; hitRate: number; evictions: number } {
-    return {
-      size: this.lockCache.size,
-      hitRate: 0, // Would need to track hits/misses for accurate rate
-      evictions: 0, // Would need to track evictions
-    };
+    return this.cacheManager.getStats();
   }
 
   /**
    * Create Lock object from optimistic result
    */
-  private createLockFromOptimistic(
+  public createLockFromOptimistic(
     resources: string | string[],
     result: OptimisticLockResult,
     options: HybridLockOptions,
@@ -951,7 +512,7 @@ export class RedlockToolkit extends EventEmitter {
   /**
    * Extend lock implementation
    */
-  private async extendLock(
+  public async extendLock(
     lock: Lock,
     ttl: number,
     options?: Partial<LockOptions>,
@@ -1023,7 +584,7 @@ export class RedlockToolkit extends EventEmitter {
   /**
    * Release lock implementation
    */
-  private async releaseLockInternal(
+  public async releaseLockInternal(
     lock: Lock,
     options?: Partial<LockOptions>,
   ): Promise<LockReleaseResult> {
@@ -1040,6 +601,16 @@ export class RedlockToolkit extends EventEmitter {
       // Remove from active locks regardless of success
       this.activeLocks.delete(lock.identifier);
       this.metrics.recordLockReleased(lock.identifier, Date.now() - startTime);
+
+      // Notify waiters via pub/sub (fire-and-forget)
+      if (this.pubSubManager) {
+        for (const resource of lock.resources) {
+          const channel = `${this.config.keyPrefix}:notify:lock:${resource}`;
+          this.pubSubManager.publish(channel, "released").catch((err) => {
+            this.logger.warn("Failed to publish lock release notification", { channel, error: String(err) });
+          });
+        }
+      }
 
       return {
         success: result.success,
@@ -1208,23 +779,28 @@ export class RedlockToolkit extends EventEmitter {
     const client = this.clients[0];
     const result = await this.executeScript(client, SCRIPTS.status, keys, []);
 
-    let statusData;
-    try {
-      statusData = typeof result === "string" ? JSON.parse(result) : result;
-    } catch (error) {
-      statusData = [];
+    // Result is a flat array of triples: [key, holder_or_empty, ttl, ...]
+    const flat = Array.isArray(result) ? result : [];
+    const statuses: Array<{
+      resource: string;
+      locked: boolean;
+      holder?: string;
+      ttl?: number;
+    }> = [];
+
+    for (let i = 0; i < flat.length; i += 3) {
+      const holder = flat[i + 1] as string;
+      const ttl = Number(flat[i + 2]);
+      const idx = Math.floor(i / 3);
+      statuses.push({
+        resource: resourceList[idx],
+        locked: holder !== '',
+        holder: holder !== '' ? holder : undefined,
+        ttl: ttl > 0 ? ttl : undefined,
+      });
     }
 
-    if (!Array.isArray(statusData)) {
-      statusData = [];
-    }
-
-    return statusData.map((item: any, index: number) => ({
-      resource: resourceList[index],
-      locked: item.holder !== null,
-      holder: item.holder,
-      ttl: item.ttl > 0 ? item.ttl : undefined,
-    }));
+    return statuses;
   }
 
   /**
@@ -1269,7 +845,7 @@ export class RedlockToolkit extends EventEmitter {
     };
 
     // Aggregate metrics from all clients
-    Object.values(cbMetrics).forEach((metrics) => {
+    cbMetrics.forEach((metrics) => {
       aggregated.successfulOperations += metrics.successfulOperations;
       aggregated.failedOperations += metrics.failedOperations;
       if (metrics.state === "open") {
@@ -1328,6 +904,81 @@ export class RedlockToolkit extends EventEmitter {
   }
 
   /**
+   * Acquire a semaphore permit
+   */
+  async acquireSemaphore(
+    resource: string,
+    options: SemaphoreOptions,
+  ): Promise<SemaphorePermit> {
+    const permit = await this.semaphoreStrategy.acquire(resource, options);
+    this.activeSemaphores.set(permit.identifier, permit);
+
+    // Clean up tracking and publish notification on release
+    permit.onRelease = () => {
+      this.activeSemaphores.delete(permit.identifier);
+      if (this.pubSubManager) {
+        const channel = `${this.config.keyPrefix}:notify:sem:${resource}`;
+        this.pubSubManager.publish(channel, "released").catch((err) => {
+          this.logger.warn("Failed to publish semaphore release notification", { channel, error: String(err) });
+        });
+      }
+    };
+
+    return permit;
+  }
+
+  /**
+   * Get semaphore status
+   */
+  async getSemaphoreStatus(
+    resource: string,
+    maxPermits: number,
+  ): Promise<SemaphoreStatus> {
+    return this.semaphoreStrategy.getStatus(resource, maxPermits);
+  }
+
+  /**
+   * Create a new CountDownLatch
+   */
+  async createCountDownLatch(
+    name: string,
+    options: CountDownLatchOptions,
+  ): Promise<CountDownLatch> {
+    return this.countDownLatchStrategy.create(name, options);
+  }
+
+  /**
+   * Get a handle to an existing CountDownLatch (e.g. from another process).
+   * Does not create any keys in Redis — the latch must already exist.
+   */
+  getCountDownLatch(
+    name: string,
+    options?: { awaitTimeout?: number; pollInterval?: number },
+  ): CountDownLatch {
+    return new CountDownLatch(
+      name,
+      0, // unknown from handle — caller can use getStatus() to learn the actual count
+      {
+        countDown: (latch, eventId) => this.countDownLatchStrategy.countDown(latch, eventId),
+        getStatus: (n) => this.countDownLatchStrategy.getStatus(n),
+        await: (latch, timeoutMs) => this.countDownLatchStrategy.awaitLatch(latch, timeoutMs),
+      },
+      {
+        ttl: 0,
+        awaitTimeout: options?.awaitTimeout ?? 30000,
+        pollInterval: options?.pollInterval ?? 100,
+      },
+    );
+  }
+
+  /**
+   * Get CountDownLatch status
+   */
+  async getCountDownLatchStatus(name: string): Promise<CountDownLatchStatus> {
+    return this.countDownLatchStrategy.getStatus(name);
+  }
+
+  /**
    * Reset metrics
    */
   resetMetrics(): void {
@@ -1335,21 +986,34 @@ export class RedlockToolkit extends EventEmitter {
   }
 
   /**
-   * Cleanup expired locks (maintenance operation)
+   * Cleanup expired locks (maintenance operation).
+   * Uses Node.js-side SCAN to avoid blocking Redis's single thread.
    */
   async cleanup(): Promise<number> {
     const pattern = `${this.config.keyPrefix}:*`;
+    const batchSize = 100;
 
     let totalCleaned = 0;
     for (const client of this.clients) {
       try {
-        const cleaned = await this.executeScript(
-          client,
-          SCRIPTS.cleanup,
-          [pattern],
-          [100], // batch size
-        );
-        totalCleaned += cleaned;
+        let cursor = "0";
+        do {
+          const [nextCursor, keys] = await this.circuitBreaker.execute(
+            this.getClientId(client),
+            () => client.scan(cursor, "MATCH", pattern, "COUNT", batchSize),
+          ) as [string, string[]];
+          cursor = nextCursor;
+
+          if (keys.length > 0) {
+            const cleaned = await this.executeScript(
+              client,
+              SCRIPTS.cleanupCheck,
+              keys,
+              [],
+            );
+            totalCleaned += cleaned;
+          }
+        } while (cursor !== "0");
       } catch (error) {
         this.emit(
           "error",
@@ -1378,9 +1042,25 @@ export class RedlockToolkit extends EventEmitter {
 
     await Promise.all(releasPromises);
 
+    // Release all active semaphore permits
+    const semaphoreReleases = Array.from(this.activeSemaphores.values()).map((permit) =>
+      permit.release().catch((err) => {
+        this.logger.warn("Failed to release semaphore permit during shutdown", { identifier: permit.identifier, error: String(err) });
+      }),
+    );
+    await Promise.all(semaphoreReleases);
+    this.activeSemaphores.clear();
+
+    // Shut down pub/sub subscribers
+    if (this.pubSubManager) {
+      await this.pubSubManager.shutdown();
+    }
+
     // Clear internal state
     this.activeLocks.clear();
+    this.compatibilityLocks.clear();
     this.circuitBreaker.clear();
+    this.metrics.stopEviction();
     this.removeAllListeners();
   }
 }
@@ -1401,6 +1081,14 @@ export { OptimisticRedlock } from "./algorithms/optimistic-redlock";
 export { CircuitBreakerManager } from "./patterns/circuit-breaker";
 export { Lock } from "./core/lock";
 export { MetricsCollector } from "./utils/metrics";
+
+// Primitives exports
+export { SemaphorePermit } from "./primitives/semaphore";
+export { CountDownLatch } from "./primitives/countdown-latch";
+
+// Pub/Sub exports
+export { PubSubManager } from "./pubsub/pubsub-manager";
+export { PubSubWaiter } from "./pubsub/pubsub-waiter";
 
 // Default export
 export default RedlockToolkit;

@@ -7,8 +7,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import RedlockToolkit from '../src/index';
-import { 
-  ResourceLockedError, 
+import {
   LockTimeoutError, 
   ConfigurationError,
   LockExpiredError 
@@ -17,7 +16,7 @@ import { createMockRedisClients, createTestRedlockToolkitConfig, sleep } from '.
 import { SCRIPT_HASHES } from "../src/utils/scripts";
 
 describe('RedlockToolkit Core Functionality', () => {
-  let mockClients: any[];
+  let mockClients: ReturnType<typeof createMockRedisClients>;
   let neolock: RedlockToolkit;
 
   beforeEach(() => {
@@ -55,7 +54,7 @@ describe('RedlockToolkit Core Functionality', () => {
         }
         
         if (hash === SCRIPT_HASHES.status) {
-          return '[]';
+          return []; // Flat array of triples: [key, holder, ttl, ...]
         }
         
         return keys.length || 1;
@@ -212,7 +211,7 @@ describe('RedlockToolkit Core Functionality', () => {
     it('should extend lock during long operations', async () => {
       const extensionCalls: number[] = [];
 
-      const lock = await neolock.acquire('test-resource', { ttl: 400 });
+      const lock = await neolock.acquire('test-resource', { ttl: 200 });
 
       // Spy on internal extend method to track auto-extension behavior
       const originalExtend = (lock as any).lockManager.extend.bind((lock as any).lockManager);
@@ -222,16 +221,16 @@ describe('RedlockToolkit Core Functionality', () => {
       });
 
       await lock.using(async (signal) => {
-        // Operation duration (300ms) triggers auto-extension
+        // Operation duration exceeds TTL minus threshold, triggering auto-extension
         await sleep(300);
-      }, { autoExtendThreshold: 50 });
+      }, { ttl: 200, autoExtendThreshold: 50 });
 
       expect(extensionCalls.length).toBeGreaterThan(0);
     });
 
     it('should abort signal when extension fails', async () => {
-      // First acquire a lock normally with longer TTL to prevent expiration
-      const lock = await neolock.acquire('test-resource', { ttl: 500 });
+      // Acquire with short TTL so auto-extension triggers quickly
+      const lock = await neolock.acquire('test-resource', { ttl: 200 });
 
       // Mock the lockManager.extend method to throw an error
       vi.spyOn((lock as any).lockManager, 'extend').mockImplementation(async () => {
@@ -243,8 +242,8 @@ describe('RedlockToolkit Core Functionality', () => {
 
       try {
         await lock.using(async (signal) => {
-          // Wait for auto-extension to trigger (but not too long to avoid expiration)
-          await sleep(150);
+          // Wait for auto-extension to trigger (threshold=100, so fires at ~100ms)
+          await sleep(200);
 
           // Check if signal was aborted and capture the state
           signalAborted = signal.aborted;
@@ -256,7 +255,7 @@ describe('RedlockToolkit Core Functionality', () => {
 
           // This should not execute if properly aborted
           await sleep(200);
-        }, { autoExtendThreshold: 50 });
+        }, { ttl: 200, autoExtendThreshold: 50 });
       } catch (error: any) {
         errorOccurred = true;
         // The error should be related to extension failure
@@ -435,11 +434,11 @@ describe('RedlockToolkit Core Functionality', () => {
     });
 
     it('should get lock status', async () => {
-      // Mock status script response
-      mockClients[0].evalsha.mockResolvedValue(JSON.stringify([
-        { key: 'neolock:resource1', holder: 'test-id', ttl: 5000 },
-        { key: 'neolock:resource2', holder: null, ttl: -2 }
-      ]));
+      // Mock status script response — flat array of triples: [key, holder, ttl, ...]
+      mockClients[0].evalsha.mockResolvedValue([
+        'neolock:resource1', 'test-id', 5000,
+        'neolock:resource2', '', -2
+      ]);
 
       const status = await neolock.getStatus(['resource1', 'resource2']);
 
@@ -453,18 +452,20 @@ describe('RedlockToolkit Core Functionality', () => {
       expect(status[1]).toEqual({
         resource: 'resource2',
         locked: false,
-        holder: null,
+        holder: undefined,
         ttl: undefined
       });
     });
 
     it('should cleanup expired locks', async () => {
       mockClients.forEach(client => {
-        client.evalsha.mockResolvedValue(5); // 5 locks cleaned
+        // scan returns keys in first batch, then cursor "0" signals done
+        client.scan.mockResolvedValue(['0', ['neolock:a', 'neolock:b']]);
+        client.evalsha.mockResolvedValue(2); // 2 persistent keys cleaned per client
       });
 
       const cleaned = await neolock.cleanup();
-      expect(cleaned).toBe(15); // 5 * 3 clients
+      expect(cleaned).toBe(6); // 2 * 3 clients
     });
 
     it('should get active locks', async () => {

@@ -84,7 +84,11 @@ export class CircuitBreaker extends EventEmitter {
    */
   private async executeWithTimeout<T>(operation: () => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
+      let settled = false;
+
       const timeoutId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
         const timeoutError = new Error(
           `Operation timed out after ${this.options.operationTimeout}ms`,
         );
@@ -95,10 +99,14 @@ export class CircuitBreaker extends EventEmitter {
 
       operation()
         .then((result) => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timeoutId);
           resolve(result);
         })
         .catch((error) => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timeoutId);
           reject(error);
         });

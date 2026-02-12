@@ -316,6 +316,97 @@ export class HybridLockError extends RedlockToolkitError {
 }
 
 /**
+ * Thrown when semaphore is at capacity
+ */
+export class SemaphoreFullError extends RedlockToolkitError {
+  public readonly resource: string;
+  public readonly activePermits: number;
+  public readonly maxPermits: number;
+
+  constructor(
+    resource: string,
+    activePermits: number,
+    maxPermits: number,
+    context?: Record<string, unknown>,
+  ) {
+    super(
+      `Semaphore full for ${resource}: ${activePermits}/${maxPermits} permits in use`,
+      context,
+    );
+    this.resource = resource;
+    this.activePermits = activePermits;
+    this.maxPermits = maxPermits;
+  }
+}
+
+/**
+ * Thrown when permit extension fails
+ */
+export class PermitExtensionError extends RedlockToolkitError {
+  public readonly resource: string;
+  public readonly identifier: string;
+
+  constructor(
+    resource: string,
+    identifier: string,
+    context?: Record<string, unknown>,
+  ) {
+    const reason = context?.reason ? `: ${context.reason}` : "";
+    super(`Failed to extend semaphore permit on ${resource}${reason}`, context);
+    this.resource = resource;
+    this.identifier = identifier;
+  }
+}
+
+/**
+ * Thrown when CountDownLatch doesn't exist or has expired
+ */
+export class LatchNotFoundError extends RedlockToolkitError {
+  public readonly latchName: string;
+
+  constructor(name: string, context?: Record<string, unknown>) {
+    super(`CountDownLatch '${name}' not found or expired`, context);
+    this.latchName = name;
+  }
+}
+
+/**
+ * Thrown when CountDownLatch already exists
+ */
+export class LatchExistsError extends RedlockToolkitError {
+  public readonly latchName: string;
+
+  constructor(name: string, context?: Record<string, unknown>) {
+    super(`CountDownLatch '${name}' already exists`, context);
+    this.latchName = name;
+  }
+}
+
+/**
+ * Thrown when awaiting CountDownLatch times out
+ */
+export class LatchTimeoutError extends RedlockToolkitError {
+  public readonly latchName: string;
+  public readonly remainingCount: number;
+  public readonly timeoutMs: number;
+
+  constructor(
+    name: string,
+    remainingCount: number,
+    timeoutMs: number,
+    context?: Record<string, unknown>,
+  ) {
+    super(
+      `CountDownLatch '${name}' timed out with ${remainingCount} remaining (timeout: ${timeoutMs}ms)`,
+      context,
+    );
+    this.latchName = name;
+    this.remainingCount = remainingCount;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
  * Utility function to determine if an error is retryable
  */
 export function isRetryableError(error: Error): boolean {
@@ -334,11 +425,6 @@ export function isRetryableError(error: Error): boolean {
     return false;
   }
 
-  // Optimistic lock conflicts - retryable with backoff
-  if (error instanceof OptimisticLockConflictError) {
-    return true;
-  }
-
   // Hybrid lock errors - depends on the underlying errors
   if (error instanceof HybridLockError) {
     // Retry if either primary or fallback error is retryable
@@ -346,6 +432,26 @@ export function isRetryableError(error: Error): boolean {
       isRetryableError(error.primaryError) ||
       (error.fallbackError ? isRetryableError(error.fallbackError) : false)
     );
+  }
+
+  // Semaphore full - retryable with backoff
+  if (error instanceof SemaphoreFullError) {
+    return true;
+  }
+
+  // Optimistic lock conflicts - not retryable (version won't change by retrying)
+  if (error instanceof OptimisticLockConflictError) {
+    return false;
+  }
+
+  // Permit extension errors - not retryable
+  if (error instanceof PermitExtensionError) {
+    return false;
+  }
+
+  // Latch errors - not retryable
+  if (error instanceof LatchNotFoundError || error instanceof LatchExistsError || error instanceof LatchTimeoutError) {
+    return false;
   }
 
   // Resource locked - retryable with backoff
@@ -382,7 +488,10 @@ export function getRetryDelay(
 ): number {
   let multiplier = 1;
 
-  if (error instanceof ResourceLockedError) {
+  if (error instanceof SemaphoreFullError) {
+    // Moderate delay for full semaphore
+    multiplier = 1.5;
+  } else if (error instanceof ResourceLockedError) {
     // Longer delay for resource conflicts
     multiplier = 2;
   } else if (error instanceof ConsensusError) {

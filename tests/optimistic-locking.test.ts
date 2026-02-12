@@ -1,18 +1,262 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import Redis from "ioredis";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { RedisClient } from "../src/core/types";
 import { OptimisticRedlock } from "../src";
 
-describe("OptimisticRedlock", () => {
-  let clients: Redis[];
-  let redlock: OptimisticRedlock;
+// Helper to create mock Redis clients
+function createMockRedisClients(count: number): RedisClient[] {
+  return Array.from({ length: count }, () => ({
+    evalsha: vi.fn(),
+    eval: vi.fn(),
+    get: vi.fn(),
+    set: vi.fn(),
+    del: vi.fn(),
+    pexpire: vi.fn(),
+    script: vi.fn(),
+    publish: vi.fn(),
+    subscribe: vi.fn(),
+    unsubscribe: vi.fn(),
+    on: vi.fn(),
+    removeListener: vi.fn(),
+    options: { host: 'localhost', port: 6379 },
+    quit: vi.fn(),
+    disconnect: vi.fn(),
+  } as any));
+}
 
-  beforeEach(async () => {
-    // Create 3 Redis clients for testing consensus
-    clients = [
-      new Redis({ port: 6379, host: "localhost", db: 0 }),
-      new Redis({ port: 6379, host: "localhost", db: 1 }),
-      new Redis({ port: 6379, host: "localhost", db: 2 }),
-    ];
+describe("OptimisticRedlock", () => {
+  let clients: RedisClient[];
+  let redlock: OptimisticRedlock;
+  let dataStores: Map<string, { value: string; version: string; expiry?: number }>[];
+
+  beforeEach(() => {
+    // Create 3 mocked Redis clients for testing consensus
+    clients = createMockRedisClients(3);
+    // Create a separate dataStore for each client to simulate independent Redis instances
+    dataStores = [new Map(), new Map(), new Map()];
+
+    // Mock the eval method to simulate optimistic locking behavior
+    clients.forEach((client: any, clientIndex: number) => {
+      const dataStore = dataStores[clientIndex];
+      
+      // Mock get method for direct access tests
+      client.get.mockImplementation((key: string) => {
+        const data = dataStore.get(key);
+        if (data) {
+          if (data.expiry && Date.now() > data.expiry) {
+            dataStore.delete(key);
+            return Promise.resolve(null);
+          }
+          return Promise.resolve(data.value);
+        }
+        // Version key lookup: strip ":version" suffix, return version from base entry
+        if (key.endsWith(':version')) {
+          const baseKey = key.slice(0, -':version'.length);
+          const baseData = dataStore.get(baseKey);
+          if (baseData) {
+            if (baseData.expiry && Date.now() > baseData.expiry) {
+              dataStore.delete(baseKey);
+              return Promise.resolve(null);
+            }
+            return Promise.resolve(baseData.version);
+          }
+        }
+        return Promise.resolve(null);
+      });
+      
+      client.eval.mockImplementation((script: string, keyCount: number, ...args: any[]) => {
+        const keys = args.slice(0, keyCount);
+        const argv = args.slice(keyCount);
+        const key = keys[0];
+
+        // --- Optimistic scripts (from optimistic-redlock.ts) ---
+        // Order matters: check more specific patterns first to avoid cross-contamination.
+
+        // COMPARE_AND_SWAP_SCRIPT (unique: 'if current == ARGV[1]')
+        if (script.includes('if current == ARGV[1]')) {
+          const current = dataStore.get(key);
+          const expectedValue = argv[0];
+          const newValue = argv[1];
+          const ttl = argv[2] ? parseInt(argv[2]) : undefined;
+
+          if (current && current.value === expectedValue) {
+            const newVersion = String(parseInt(current.version) + 1);
+            dataStore.set(key, {
+              value: newValue,
+              version: newVersion,
+              expiry: ttl ? Date.now() + ttl : undefined,
+            });
+            return Promise.resolve(parseInt(newVersion));
+          }
+          return Promise.resolve(null);
+        }
+
+        // OPTIMISTIC_DELETE_SCRIPT (unique: '"DEL", KEYS[1] .. ":version"')
+        if (script.includes('"DEL", KEYS[1] .. ":version"')) {
+          const currentData = dataStore.get(key);
+          const expectedVersion = argv[0];
+
+          if (currentData && currentData.version === expectedVersion) {
+            dataStore.delete(key);
+            return Promise.resolve(1);
+          }
+          return Promise.resolve(0);
+        }
+
+        // OPTIMISTIC_WRITE_SCRIPT (unique: 'ARGV[2] == "0"')
+        if (script.includes('ARGV[2] == "0"')) {
+          const newValue = argv[0];
+          const expectedVersion = argv[1];
+          const ttl = argv[2] ? parseInt(argv[2]) : undefined;
+
+          // Check expiration
+          let currentData = dataStore.get(key);
+          if (currentData?.expiry && Date.now() > currentData.expiry) {
+            dataStore.delete(key);
+            currentData = undefined;
+          }
+
+          // First write (no version exists)
+          if (!currentData && expectedVersion === "0") {
+            dataStore.set(key, {
+              value: newValue,
+              version: "1",
+              expiry: ttl ? Date.now() + ttl : undefined,
+            });
+            return Promise.resolve(1);
+          }
+
+          // Version matches - update allowed
+          if (currentData && currentData.version === expectedVersion) {
+            const newVersion = String(parseInt(currentData.version) + 1);
+            dataStore.set(key, {
+              value: newValue,
+              version: newVersion,
+              expiry: ttl ? Date.now() + ttl : undefined,
+            });
+            return Promise.resolve(parseInt(newVersion));
+          }
+
+          // Version mismatch
+          return Promise.resolve(null);
+        }
+
+        // OPTIMISTIC_READ_SCRIPT (unique: 'return {value, version')
+        if (script.includes('return {value, version')) {
+          const data = dataStore.get(key);
+          if (data) {
+            if (data.expiry && Date.now() > data.expiry) {
+              dataStore.delete(key);
+              return Promise.resolve(null);
+            }
+            return Promise.resolve([data.value, data.version]);
+          }
+          return Promise.resolve(null);
+        }
+
+        // --- Redlock scripts (from scripts.ts, used by transaction()) ---
+
+        // ACQUIRE_SCRIPT
+        if (script.includes('RedlockToolkit Acquire Script')) {
+          const identifier = argv[0];
+          const ttl = parseInt(argv[1]);
+
+          for (const k of keys) {
+            const existing = dataStore.get(k);
+            if (existing && existing.value !== identifier &&
+                (!existing.expiry || Date.now() < existing.expiry)) {
+              return Promise.resolve(0);
+            }
+          }
+
+          for (const k of keys) {
+            dataStore.set(k, {
+              value: identifier,
+              version: '1',
+              expiry: Date.now() + ttl,
+            });
+          }
+          return Promise.resolve(keys.length);
+        }
+
+        // RELEASE_SCRIPT
+        if (script.includes('RedlockToolkit Release Script')) {
+          const identifier = argv[0];
+          let released = 0;
+
+          for (const k of keys) {
+            const existing = dataStore.get(k);
+            if (existing && existing.value === identifier) {
+              dataStore.delete(k);
+              released++;
+            }
+          }
+          return Promise.resolve(released);
+        }
+
+        // EXTEND_SCRIPT
+        if (script.includes('RedlockToolkit Extend Script')) {
+          const identifier = argv[0];
+          const ttl = parseInt(argv[1]);
+
+          for (const k of keys) {
+            const existing = dataStore.get(k);
+            if (!existing || existing.value !== identifier) {
+              return Promise.resolve(0);
+            }
+          }
+
+          for (const k of keys) {
+            const existing = dataStore.get(k)!;
+            dataStore.set(k, { ...existing, expiry: Date.now() + ttl });
+          }
+          return Promise.resolve(keys.length);
+        }
+
+        return Promise.resolve(null);
+      });
+      
+      // Mock evalsha to simulate script cache for regular lock operations
+      client.evalsha.mockImplementation((_hash: string, keyCount: number, ...args: any[]) => {
+        const keys = args.slice(0, keyCount);
+        const argv = args.slice(keyCount);
+        const key = keys[0];
+        const identifier = argv[0];
+        const ttl = argv[1];
+        
+        // For Redlock acquire operations (used in transaction method)
+        // Check if this is a lock acquisition or release
+        if (identifier && ttl) {
+          // Acquisition attempt
+          const lockKey = key + ':txlock';
+          const existingLock = dataStore.get(lockKey);
+          
+          if (!existingLock || (existingLock.expiry && Date.now() > existingLock.expiry)) {
+            // No lock or expired lock - acquire it
+            dataStore.set(lockKey, { 
+              value: identifier, 
+              version: '1',
+              expiry: Date.now() + parseInt(ttl)
+            });
+            return Promise.resolve(1);
+          }
+          
+          // Lock exists and is not expired
+          return Promise.resolve(0);
+        } else if (identifier && !ttl) {
+          // Release attempt
+          const lockKey = key + ':txlock';
+          const existingLock = dataStore.get(lockKey);
+          
+          if (existingLock && existingLock.value === identifier) {
+            dataStore.delete(lockKey);
+            return Promise.resolve(1);
+          }
+          return Promise.resolve(0);
+        }
+        
+        return Promise.resolve(0);
+      });
+    });
 
     redlock = new OptimisticRedlock(clients, {
       driftFactor: 0.01,
@@ -23,17 +267,10 @@ describe("OptimisticRedlock", () => {
       conflictRetryDelay: 50,
       conflictBackoffFactor: 2,
     });
-
-    // Clean up test data
-    for (const client of clients) {
-      await client.flushdb();
-    }
   });
 
-  afterEach(async () => {
-    for (const client of clients) {
-      await client.quit();
-    }
+  afterEach(() => {
+    vi.clearAllMocks();
   });
 
   describe("Optimistic Read Operations", () => {
@@ -401,18 +638,13 @@ describe("OptimisticRedlock", () => {
 
   describe("Error Handling", () => {
     it("should handle network errors gracefully", async () => {
-      // Create a separate instance for this test
-      const testClients = [
-        new Redis({ port: 6379, host: "localhost", db: 3 }),
-        new Redis({ port: 6379, host: "localhost", db: 4 }),
-        new Redis({ port: 6379, host: "localhost", db: 5 }),
-      ];
-      const testRedlock = new OptimisticRedlock(testClients);
-
-      // Close all connections
-      for (const client of testClients) {
-        await client.quit();
-      }
+      // Create clients that will fail
+      const errorClients = createMockRedisClients(3);
+      errorClients.forEach((client: any) => {
+        client.eval.mockRejectedValue(new Error("Network error"));
+      });
+      
+      const testRedlock = new OptimisticRedlock(errorClients);
 
       // Operations should fail gracefully
       const result = await testRedlock.optimisticRead("test:resource");

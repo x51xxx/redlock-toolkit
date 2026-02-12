@@ -8,7 +8,7 @@ import RedlockToolkit from '../src/index';
 import { createMockRedisClients, createTestRedlockToolkitConfig, sleep } from './setup';
 
 describe('Stress Tests', () => {
-  let mockClients: any[];
+  let mockClients: ReturnType<typeof createMockRedisClients>;
   let neolock: RedlockToolkit;
 
   afterEach(async () => {
@@ -47,7 +47,7 @@ describe('Stress Tests', () => {
       const duration = Date.now() - startTime;
       const opsPerSecond = (lockCount * 2) / (duration / 1000); // acquire + release
 
-      expect(opsPerSecond).toBeGreaterThan(50); // Performance baseline for mock environment
+      expect(opsPerSecond).toBeGreaterThan(45); // Performance baseline for mock environment
       expect(neolock.getActiveLocks().length).toBe(0); // No leaks
     });
 

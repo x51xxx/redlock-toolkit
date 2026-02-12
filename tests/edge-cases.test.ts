@@ -5,12 +5,12 @@
  * Tests resilience against pathological inputs and timing conditions.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import RedlockToolkit, { ConfigurationError, LockExpiredError, LockTimeoutError } from '../src/index';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import RedlockToolkit, { LockTimeoutError } from '../src/index';
 import { createMockRedisClients, createTestRedlockToolkitConfig, sleep } from './setup';
 
 describe('Edge Cases', () => {
-  let mockClients: any[];
+  let mockClients: ReturnType<typeof createMockRedisClients>;
   let neolock: RedlockToolkit;
 
   afterEach(async () => {
@@ -28,7 +28,8 @@ describe('Edge Cases', () => {
       neolock = new RedlockToolkit(createTestRedlockToolkitConfig(mockClients, {
         defaultLockOptions: {
           ttl: 1,
-          retryCount: 0
+          retryCount: 0,
+          autoExtendThreshold: 0
         }
       }));
 
@@ -64,7 +65,8 @@ describe('Edge Cases', () => {
         defaultLockOptions: {
           ttl: 10,
           driftFactor: 0.99, // Extreme drift: assumes 99% clock skew
-          retryCount: 0
+          retryCount: 0,
+          autoExtendThreshold: 0
         }
       }));
 
@@ -300,7 +302,8 @@ describe('Edge Cases', () => {
           ttl: 100,
           retryCount: 2,
           retryDelay: -100, // Invalid but might occur
-          retryJitter: 0
+          retryJitter: 0,
+          autoExtendThreshold: 0
         }
       }));
 
@@ -600,8 +603,8 @@ describe('Edge Cases', () => {
     });
 
     it('should handle status check for non-existent resources', async () => {
-      // Mock should return array with null holder for non-existent resource
-      mockClients[0].evalsha.mockResolvedValueOnce('[{"key":"neolock:non-existent","holder":null,"ttl":-2}]');
+      // Mock returns flat array triple: [key, empty_holder, ttl]
+      mockClients[0].evalsha.mockResolvedValueOnce(['neolock:non-existent', '', -2]);
 
       const status = await neolock.getStatus(['non-existent']);
       expect(status).toHaveLength(1);

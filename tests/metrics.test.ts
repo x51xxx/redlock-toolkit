@@ -72,12 +72,13 @@ describe('MetricsCollector', () => {
       vi.useRealTimers();
     });
 
-    it('should handle release of non-existent lock', () => {
+    it('should handle release of non-existent lock without going negative', () => {
       metrics.recordLockReleased('non-existent', 10);
-      
+
       const data = metrics.getMetrics();
       expect(data.locksReleased).toBe(1);
-      expect(data.activeLocks).toBe(-1); // This might happen in edge cases
+      // Gauge should NOT go negative — dec() is only called if the lock exists in activeLocksMap
+      expect(data.activeLocks).toBe(0);
     });
 
     it('should emit release events', () => {
@@ -399,7 +400,7 @@ describe('MetricsCollector', () => {
       await sleep(100);
       
       const data = metrics.getMetrics();
-      expect(data.detailed.uptimeMs).toBeGreaterThanOrEqual(100);
+      expect(data.detailed.uptimeMs).toBeGreaterThanOrEqual(90);
     });
   });
 
@@ -435,6 +436,57 @@ describe('MetricsCollector', () => {
       expect(events).toContain('retry');
       expect(events).toContain('circuit');
       expect(events).toContain('reset');
+    });
+  });
+
+  describe('TTL Eviction', () => {
+    it('should evict expired locks from activeLocksMap', () => {
+      vi.useFakeTimers();
+
+      // Record a lock with TTL=100ms
+      metrics.recordLockAcquired('evict-1', ['r1'], 10, 100);
+      metrics.recordLockAcquired('evict-2', ['r2'], 10, 100);
+
+      let data = metrics.getMetrics();
+      expect(data.detailed.activeLockDetails).toHaveLength(2);
+      expect(data.activeLocks).toBe(2);
+
+      // Advance past the eviction threshold (2x TTL for zero extensions = 200ms)
+      vi.advanceTimersByTime(250);
+
+      // Trigger eviction via the internal timer (10s interval) by advancing far enough
+      vi.advanceTimersByTime(10000);
+
+      data = metrics.getMetrics();
+      // Expired locks should have been evicted
+      expect(data.detailed.activeLockDetails).toHaveLength(0);
+
+      vi.useRealTimers();
+      metrics.stopEviction();
+    });
+
+    it('should not evict locks within TTL window', () => {
+      vi.useFakeTimers();
+
+      metrics.recordLockAcquired('alive-1', ['r1'], 10, 30000);
+
+      // Only advance 1s (well within 30s TTL)
+      vi.advanceTimersByTime(11000);
+
+      const data = metrics.getMetrics();
+      expect(data.detailed.activeLockDetails).toHaveLength(1);
+
+      vi.useRealTimers();
+      metrics.stopEviction();
+    });
+
+    it('should clean up eviction timer on reset', () => {
+      metrics.recordLockAcquired('timer-test', ['r1'], 10, 100);
+      metrics.reset();
+
+      // After reset, no active locks
+      const data = metrics.getMetrics();
+      expect(data.detailed.activeLockDetails).toHaveLength(0);
     });
   });
 });

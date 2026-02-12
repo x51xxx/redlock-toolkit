@@ -1,6 +1,6 @@
 {
   "name": "@trishchuk/redlock-toolkit",
-  "version": "0.9.2",
+  "version": "0.10.0",
   "description": "Advanced Redis distributed locking library with Redlock algorithm, Circuit Breaker pattern, automatic extension and optimistic locking support",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -81,7 +81,9 @@
   },
   "typesVersions": {
     ">=4.5": {
-      "*": ["dist/*"]
+      "*": [
+        "dist/*"
+      ]
     }
   },
   "dependencies": {
@@ -90,14 +92,12 @@
   "devDependencies": {
     "@eslint/js": "^9.29.0",
     "@types/node": "^18.19.112",
-    "@typescript-eslint/eslint-plugin": "^6.0.0",
-    "@typescript-eslint/parser": "^6.0.0",
-    "eslint": "^8.57.1",
-    "eslint-config-prettier": "^9.0.0",
-    "eslint-plugin-prettier": "^5.0.0",
-    "globals": "^16.2.0",
-    "ioredis-mock": "^8.9.0",
-    "prettier": "^3",
+    "eslint": "^9.0.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.5.5",
+    "globals": "^17.3.0",
+    "ioredis-mock": "^8.13.1",
+    "prettier": "^3.8.1",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.34.1",

@@ -5,13 +5,13 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { ConsensusManager } from '../src/utils/consensus-manager';
-import { SilentLogger, ConsoleLogger, LogLevel } from '../src/core/logger';
+import { SilentLogger } from '../src/core/logger';
 import { ConsensusError, ConfigurationError, CircuitBreakerOpenError } from '../src/core/errors';
 import { createMockRedisClients } from './setup';
 
 describe('ConsensusManager', () => {
   let consensusManager: ConsensusManager;
-  let mockClients: any[];
+  let mockClients: ReturnType<typeof createMockRedisClients>;
   let logger: SilentLogger;
 
   beforeEach(() => {

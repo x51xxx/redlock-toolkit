@@ -71,6 +71,7 @@ export class AutoExtensionManager {
   private signal?: AutoExtensionSignal;
   private _expiration: number;
   private _extensions = 0;
+  private _stopped = false;
 
   constructor(private config: AutoExtensionConfig) {
     this._expiration = config.expiration;
@@ -105,12 +106,13 @@ export class AutoExtensionManager {
       throw new Error("Auto-extension already started");
     }
 
+    this._stopped = false;
     this.signal = new AutoExtensionSignalImpl(this._expiration);
-    
+
     if (this.config.autoExtendThreshold > 0) {
       this.scheduleNextExtension();
     }
-    
+
     return this.signal;
   }
 
@@ -118,17 +120,27 @@ export class AutoExtensionManager {
    * Stop auto-extension cycle
    */
   async stop(): Promise<void> {
+    this._stopped = true;
+
     // Clear any scheduled timer
     if (this.extensionTimer) {
       clearTimeout(this.extensionTimer);
       this.extensionTimer = undefined;
     }
 
-    // Wait for any ongoing extension to complete
-    if (this.extensionPromise) {
-      await this.extensionPromise.catch(() => {
+    // Wait for any ongoing extension to complete.
+    // Loop handles the edge case where a new extension promise is set
+    // between our check and the await yielding.
+    while (this.extensionPromise) {
+      const current = this.extensionPromise;
+      await current.catch(() => {
         // Ignore extension errors during cleanup
       });
+      // If the promise reference hasn't changed, we're done
+      if (this.extensionPromise === current) {
+        this.extensionPromise = undefined;
+        break;
+      }
     }
 
     // Clear signal
@@ -139,13 +151,16 @@ export class AutoExtensionManager {
    * Schedule the next extension check
    */
   private scheduleNextExtension(): void {
+    if (this._stopped) return;
+
     const timeUntilExtension = this.timeToExpiration - this.config.autoExtendThreshold;
-    
-    // Use setTimeout to prevent stack overflow, with minimum delay for testing
-    const delay = Math.max(0, Math.min(timeUntilExtension, 10));
-    
+    const delay = Math.max(0, timeUntilExtension);
+
     this.extensionTimer = setTimeout(() => {
       this.extensionTimer = undefined;
+      if (this._stopped || !this.config.isValid()) {
+        return;
+      }
       this.extensionPromise = this.performExtension();
     }, delay);
   }
@@ -156,7 +171,7 @@ export class AutoExtensionManager {
   private async performExtension(): Promise<void> {
     try {
       // Check if extension is still needed
-      if (!this.signal || this.signal.aborted || !this.config.isValid()) {
+      if (this._stopped || !this.signal || this.signal.aborted || !this.config.isValid()) {
         return;
       }
 
@@ -170,7 +185,12 @@ export class AutoExtensionManager {
 
       // Attempt to extend the lock
       const result = await this.config.extend(this.config.ttl);
-      
+
+      // Re-check stopped state after async operation
+      if (this._stopped) {
+        return;
+      }
+
       if (!result.success) {
         const error = new Error("Failed to extend lock");
         this.signal.abort(error);
@@ -182,8 +202,8 @@ export class AutoExtensionManager {
       this._expiration = result.expiration;
       this._extensions++;
 
-      // Schedule next extension if still valid
-      if (this.signal && !this.signal.aborted && this.config.isValid()) {
+      // Schedule next extension if still valid and not stopped
+      if (!this._stopped && this.signal && !this.signal.aborted && this.config.isValid()) {
         this.scheduleNextExtension();
       }
     } catch (error) {

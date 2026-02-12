@@ -54,18 +54,27 @@ describe('Lua Scripts', () => {
 
     it('should have extend script with ownership validation', () => {
       const script = SCRIPTS.extend.source;
-      
+
       expect(script).toContain('KEYS');
       expect(script).toContain('ARGV');
       expect(script).toContain('return');
-      
+
       // Should validate ownership before extending
       expect(script).toContain('GET');
       expect(script).toContain('ARGV[1]'); // identifier check
-      
+
       // Should set new expiration
       expect(script).toContain('SET');
       expect(script).toContain('PX');
+    });
+
+    it('should use PEXPIRE (not EXPIRE) for data key TTL in extend script', () => {
+      const script = SCRIPTS.extend.source;
+
+      // Must use PEXPIRE for millisecond precision to prevent
+      // data key deletion when TTL < 1 second
+      expect(script).toContain('PEXPIRE');
+      expect(script).not.toContain("EXPIRE', dataKey, math.floor");
     });
 
     it('should have release script with safe deletion', () => {
@@ -94,11 +103,16 @@ describe('Lua Scripts', () => {
 
     it('should have status script for lock inspection', () => {
       const script = SCRIPTS.status.source;
-      
+
       expect(script).toContain('KEYS');
       expect(script).toContain('return');
-      expect(script).toContain('cjson.encode');
-      
+
+      // Must NOT use cjson.encode (RESP2-incompatible map-tables)
+      expect(script).not.toContain('cjson.encode');
+
+      // Should return flat arrays
+      expect(script).toContain('result');
+
       // Should get lock info
       expect(script).toContain('GET');
       expect(script).toContain('PTTL');
@@ -106,32 +120,36 @@ describe('Lua Scripts', () => {
 
     it('should have acquire with wait functionality', () => {
       const script = SCRIPTS.acquireWithWait.source;
-      
+
       expect(script).toContain('KEYS');
       expect(script).toContain('ARGV');
       expect(script).toContain('return');
-      
+
       // Should check max wait time
       expect(script).toContain('ARGV[3]'); // maxWait
-      
-      // Should return wait suggestion
-      expect(script).toContain('waitTime');
-      expect(script).toContain('blockedBy');
+
+      // Should return flat array with blocker info
+      expect(script).toContain('blockerCount');
+
+      // Must NOT use Lua map-table syntax
+      expect(script).not.toContain('waitTime =');
+      expect(script).not.toContain('blockedBy =');
     });
 
-    it('should have cleanup script for maintenance', () => {
-      const script = SCRIPTS.cleanup.source;
-      
+    it('should have cleanup check script for maintenance', () => {
+      const script = SCRIPTS.cleanupCheck.source;
+
       expect(script).toContain('KEYS');
-      expect(script).toContain('ARGV');
       expect(script).toContain('return');
-      
-      // Should use SCAN for safe iteration
-      expect(script).toContain('SCAN');
-      expect(script).toContain('MATCH');
-      
-      // Should check TTL
+
+      // Should check TTL per key
       expect(script).toContain('PTTL');
+
+      // Should delete persistent keys (TTL == -1)
+      expect(script).toContain('DEL');
+
+      // Should NOT contain SCAN (scanning is done in Node.js)
+      expect(script).not.toContain('SCAN');
     });
   });
 
@@ -185,15 +203,14 @@ describe('Lua Scripts', () => {
       expect(script).toContain('DEL');
     });
 
-    it('should handle edge cases in cleanup script', () => {
-      const script = SCRIPTS.cleanup.source;
-      
-      // Should handle cursor completion
-      expect(script).toContain('until cursor == 0');
-      
-      // Should handle different TTL states
-      expect(script).toContain('ttl == -2'); // Key doesn't exist
-      expect(script).toContain('ttl == -1'); // Key exists but no TTL
+    it('should handle edge cases in cleanup check script', () => {
+      const script = SCRIPTS.cleanupCheck.source;
+
+      // Should only delete keys with no TTL (persistent)
+      expect(script).toContain('ttl == -1');
+
+      // Should iterate over provided keys
+      expect(script).toContain('#KEYS');
     });
   });
 
@@ -226,7 +243,7 @@ describe('Lua Scripts', () => {
         
         // Should avoid excessive nested loops (reasonable complexity)
         const forLoopCount = (source.match(/for /g) || []).length;
-        expect(forLoopCount).toBeLessThanOrEqual(3); // Allow reasonable complexity for multi-key operations
+        expect(forLoopCount).toBeLessThanOrEqual(4); // Allow reasonable complexity for multi-key operations
       });
     });
 
@@ -277,12 +294,34 @@ describe('Lua Scripts', () => {
       // Acquire and extend should return count
       expect(SCRIPTS.acquire.source).toContain('return #KEYS');
       expect(SCRIPTS.extend.source).toContain('return #KEYS');
-      
+
       // Release should return count of released
       expect(SCRIPTS.release.source).toContain('return released');
-      
-      // Status should return JSON
-      expect(SCRIPTS.status.source).toContain('cjson.encode');
+
+      // Status should return flat array (RESP2-compatible)
+      expect(SCRIPTS.status.source).not.toContain('cjson.encode');
+    });
+
+    it('should use RESP2-compatible array returns in optimistic scripts', () => {
+      // Optimistic scripts must return flat arrays {status, version, extra}
+      // NOT Lua map-tables which don't serialize correctly over RESP2/ioredis
+      const optimisticAcquire = SCRIPTS.optimisticAcquire.source;
+      const optimisticUpdate = SCRIPTS.optimisticUpdate.source;
+
+      // Success returns: {1, newVersion, count}
+      expect(optimisticAcquire).toContain('{1, newVersion, #KEYS}');
+      expect(optimisticUpdate).toContain('{1, newVersion, #KEYS}');
+
+      // Conflict returns: {0, version, reason_string}
+      expect(optimisticAcquire).toContain("{0, currentVersionNum, 'locked'}");
+      expect(optimisticAcquire).toContain("{0, ver, 'version_mismatch'}");
+      expect(optimisticUpdate).toContain("{0, ver, 'version_mismatch'}");
+
+      // Must NOT use Lua map-table syntax (key = value)
+      expect(optimisticAcquire).not.toContain('conflict = true');
+      expect(optimisticAcquire).not.toContain('success = true');
+      expect(optimisticUpdate).not.toContain('conflict = true');
+      expect(optimisticUpdate).not.toContain('success = true');
     });
 
     it('should use consistent error patterns', () => {

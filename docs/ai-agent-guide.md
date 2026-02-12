@@ -1,7 +1,7 @@
 # AI Agent Quick Guide - redlock-toolkit
 
 ## Overview
-redlock-toolkit provides distributed locking for Redis-based applications, ensuring data consistency and preventing race conditions in distributed systems.
+redlock-toolkit provides distributed locking and synchronization primitives for Redis-based applications, ensuring data consistency and preventing race conditions in distributed systems.
 
 ## Key Interfaces
 
@@ -14,10 +14,36 @@ interface Lock {
   expiration: number;        // Unix timestamp when lock expires
   duration: number;          // How long lock has been held (ms)
   isValid: boolean;          // Not expired and not released
-  
-  extend(ttl: number): Promise<Lock>;
-  release(): Promise<LockReleaseResult>;
-  using<T>(fn: (signal: LockSignal) => Promise<T>): Promise<T>;
+
+  extend(ttl?: number, options?: Partial<LockOptions>): Promise<Lock>;
+  release(options?: Partial<LockOptions>): Promise<LockReleaseResult>;
+  using<T>(fn: (signal: LockSignal) => Promise<T>, options?: Partial<LockOptions>): Promise<T>;
+}
+
+// Semaphore permit interface
+interface SemaphorePermit {
+  resource: string;           // Semaphore resource name
+  identifier: string;         // Unique permit ID
+  expiration: number;         // Unix timestamp when permit expires
+  extensions: number;         // Number of extensions performed
+  released: boolean;          // Whether permit has been released
+  isValid: boolean;           // Not expired and not released
+  isExpired: boolean;         // Whether permit has expired
+  timeToExpiration: number;   // Milliseconds until expiration
+
+  extend(ttl?: number): Promise<SemaphorePermit>;
+  release(): Promise<{ success: boolean; remainingCount: number }>;
+  using<T>(fn: (signal: LockSignal) => Promise<T>, options?: { ttl?: number; autoExtendThreshold?: number }): Promise<T>;
+}
+
+// CountDownLatch interface
+interface CountDownLatch {
+  name: string;               // Latch name
+  targetCount: number;        // Original count (N)
+
+  countDown(eventId?: string): Promise<CountDownResult>;
+  await(timeoutMs?: number): Promise<boolean>;
+  getStatus(): Promise<CountDownLatchStatus>;
 }
 
 // Lock configuration
@@ -28,6 +54,33 @@ interface LockOptions {
   retryJitter?: number;      // Random jitter to add (ms)
   driftFactor?: number;      // Clock drift compensation (0.01 = 1%)
   autoExtendThreshold?: number; // Auto-extend when X ms remaining
+  identifier?: string;       // Custom lock identifier
+}
+
+// Semaphore configuration
+interface SemaphoreOptions {
+  maxPermits: number;         // Max concurrent permit holders
+  ttl?: number;               // Permit TTL (ms)
+  retryCount?: number;        // Retry attempts when full
+  retryDelay?: number;        // Retry delay (ms)
+  retryJitter?: number;       // Retry jitter (ms)
+  driftFactor?: number;       // Clock drift factor
+  autoExtendThreshold?: number; // Auto-extend threshold (ms)
+  identifier?: string;        // Custom permit identifier
+}
+
+// CountDownLatch configuration
+interface CountDownLatchOptions {
+  count: number;              // Events to count down from
+  ttl?: number;               // Latch TTL (ms), expires if not completed
+  awaitTimeout?: number;      // Default await timeout (ms)
+  pollInterval?: number;      // Polling interval when waiting (ms)
+}
+
+// Pub/Sub configuration
+interface PubSubConfig {
+  enabled: boolean;           // Enable pub/sub waiting
+  subscriberClients?: RedisClient[]; // Optional dedicated subscriber connections
 }
 
 // Lock signal for auto-extending locks
@@ -36,12 +89,14 @@ interface LockSignal {
   readonly error?: Error;      // Reason for abortion
   readonly expiration: number; // Current expiration time
   addEventListener(type: 'abort', listener: () => void): void;
+  removeEventListener(type: 'abort', listener: () => void): void;
 }
 
 // Circuit breaker configuration
 interface CircuitBreakerOptions {
   failureThreshold?: number;  // Failures before opening circuit
   resetTimeout?: number;       // Time before retry (ms)
+  maxRetries?: number;         // Max retries when half-open
   operationTimeout?: number;   // Max operation time (ms)
 }
 
@@ -63,11 +118,18 @@ npm install @trishchuk/redlock-toolkit
 
 ### Import
 ```typescript
-// Main locking class and errors
-import RedlockToolkit, { 
+// Main locking class, primitives, and errors
+import RedlockToolkit, {
+  SemaphorePermit,
+  CountDownLatch,
   ResourceLockedError,
   LockTimeoutError,
-  ConsensusError
+  ConsensusError,
+  CircuitBreakerOpenError,
+  SemaphoreFullError,
+  LatchExistsError,
+  LatchTimeoutError,
+  RedlockToolkitError
 } from '@trishchuk/redlock-toolkit';
 import Redis from 'ioredis';
 ```
@@ -85,13 +147,18 @@ const redis = new Redis({
 // Multiple instances provide fault tolerance (recommended for production)
 const redlock = new RedlockToolkit({
   clients: [redis],
-  // Clock drift compensation - accounts for time differences between servers
-  driftFactor: 0.01, // multiplied by TTL to determine drift time
-  
-  // Retry configuration for lock acquisition
-  retryCount: 3,     // Number of attempts before giving up
-  retryDelay: 200,   // Base delay between retries (ms)
-  retryJitter: 100   // Random jitter to prevent thundering herd
+  defaultLockOptions: {
+    ttl: 30000,
+    retryCount: 3,
+    retryDelay: 200,
+    retryJitter: 100,
+    driftFactor: 0.01,
+  },
+  // Optional: enable pub/sub for faster lock release notifications
+  pubSub: {
+    enabled: true,
+    // subscriberClients: [subscriberRedis], // optional dedicated connections
+  },
 });
 ```
 
@@ -101,14 +168,14 @@ const redlock = new RedlockToolkit({
 ```typescript
 // Acquire lock with manual release - use when you need fine control
 const lock = await redlock.acquire(
-  ['resource-key'],  // Array of resources to lock atomically
-  5000               // TTL in milliseconds - lock auto-expires after this time
+  'resource-key',    // Resource to lock (string or string[])
+  { ttl: 5000 }     // Options
 );
 
 try {
   // Critical section - only one process can execute this code
   await doWork();
-  
+
   // Extend lock if operation takes longer than expected
   if (needMoreTime) {
     await lock.extend(3000); // Extend by 3 seconds
@@ -121,107 +188,175 @@ try {
 
 #### Automatic Lock Management (Recommended)
 ```typescript
-// Using pattern - automatically handles acquire and release
-await redlock.using(
-  ['resource-key'],  // Resources to lock
-  5000,              // TTL in milliseconds
+// Using pattern - automatically handles acquire, extend, and release
+const result = await redlock.using(
+  'resource-key',      // Resources to lock
   async (signal) => {
-    // signal is an AbortSignal - check it for lock expiration
+    // signal tracks lock validity - check it for long operations
     while (!signal.aborted && hasMoreWork()) {
       await doWork();
     }
-    
+    return 'done';
     // Lock is automatically released when this function returns
-    // Even if an error is thrown, lock will be released
-  }
+  },
+  { ttl: 5000, autoExtendThreshold: 1000 }
 );
+```
+
+### Distributed Semaphore
+
+Semaphore allows N concurrent holders (vs mutex which allows exactly 1). Backed by Redis ZSET with score=expirationTimestamp for atomic expired-permit cleanup.
+
+```typescript
+// Acquire a permit (up to maxPermits concurrent holders)
+const permit = await redlock.acquireSemaphore('api-rate-limit', {
+  maxPermits: 5,        // Allow 5 concurrent callers
+  ttl: 30000,           // 30 second permit TTL
+  retryCount: 3,        // Retry if full
+  retryDelay: 200,
+});
+
+try {
+  await callExternalApi();
+} finally {
+  await permit.release();
+}
+
+// Auto-extending semaphore with using()
+const result = await permit.using(async (signal) => {
+  // Permit is automatically extended while this runs
+  await longRunningApiCall();
+  return response;
+});
+
+// Check semaphore status
+const status = await redlock.getSemaphoreStatus('api-rate-limit', 5);
+// { resource: 'api-rate-limit', activePermits: 3, maxPermits: 5, holders: [...] }
+```
+
+### Distributed CountDownLatch
+
+CountDownLatch synchronizes N distributed processes. One or more waiters block until the count reaches 0.
+
+```typescript
+// Create a latch that waits for 3 events
+const latch = await redlock.createCountDownLatch('migration-ready', {
+  count: 3,
+  ttl: 120000,          // 2 minute TTL (safety net)
+  pollInterval: 100,    // Polling interval for await()
+});
+
+// Each worker counts down when ready (idempotent per eventId)
+await latch.countDown('worker-db');
+await latch.countDown('worker-cache');
+await latch.countDown('worker-search');
+
+// Waiter blocks until count=0 or timeout
+const completed = await latch.await(60000); // 60s timeout
+// completed === true
+
+// Check status
+const status = await latch.getStatus();
+// { exists: true, remainingCount: 0, targetCount: 3, completed: true, ttl: 115000 }
+
+// Get status by name (without latch instance)
+const status2 = await redlock.getCountDownLatchStatus('migration-ready');
 ```
 
 ### Optimistic Locking
 Optimistic locking prevents lost updates when multiple clients modify the same resource. It's ideal for high-read, low-write scenarios.
 
 ```typescript
-const optimistic = new OptimisticRedlock([redis]);
+// Optimistic locking is available through the RedlockToolkit API
+const result = await redlock.acquireOptimistic('order:123', {
+  expectedVersion: 5,                   // Expected version
+  ttl: 5000,
+  conflictResolution: 'fail',           // 'fail' | 'retry' | 'fallback'
+});
 
-// First, read current version
-const currentVersion = await redis.get('order:123:version');
-
-// Process order with optimistic lock
-try {
-  const lock = await optimistic.acquire(
-    ['order:123'],      // Resource key
-    5000,               // TTL
-    currentVersion      // Expected version - lock fails if version changed
-  );
-  
+if (result.success) {
   // Safe to modify - no other process changed the data
   await updateOrder(123);
-  
-  // Update version for next operation
-  await redis.incr('order:123:version');
-  
-  await lock.release();
-} catch (error) {
+
+  // Update with new expected version
+  await redlock.updateOptimistic('order:123', result.currentVersion!, {
+    ttl: 5000,
+  });
+} else if (result.conflict) {
   // Version mismatch - another process modified the data
-  // Retry with fresh data or handle conflict
-  console.log('Order was modified by another process');
+  console.log(`Order was modified: expected v5, found v${result.currentVersion}`);
 }
 ```
 
 ### Circuit Breaker Pattern
-Circuit breaker prevents cascading failures by failing fast when Redis is unavailable.
+The circuit breaker is built into `RedlockToolkit` and prevents cascading failures by failing fast when Redis is unavailable.
 
 ```typescript
-const breaker = new CircuitBreaker(redlock, {
-  // Circuit opens after 5 consecutive failures
-  failureThreshold: 5,
-  
-  // Time to wait before attempting to close circuit (ms)
-  resetTimeout: 30000,
-  
-  // Optional: custom failure detection
-  isFailure: (error) => {
-    // Don't open circuit for lock contention, only for Redis failures
-    return !(error instanceof ResourceLockedError);
+// Circuit breaker is configured at the toolkit level
+const redlock = new RedlockToolkit({
+  clients: [redis],
+  circuitBreaker: {
+    failureThreshold: 5,   // Opens after 5 consecutive failures
+    resetTimeout: 30000,   // Wait 30s before half-open test
+    maxRetries: 3,         // Retries when half-open
+    operationTimeout: 5000 // Per-operation timeout
+  }
+});
+
+// Monitor circuit breaker state changes
+redlock.on('circuit:stateChanged', (newState) => {
+  console.log(`Circuit breaker state: ${newState}`);
+  if (newState === 'open') {
+    console.error('Redis appears unavailable - using fallback');
   }
 });
 
 try {
-  // Fails immediately if circuit is open, preventing Redis timeout delays
-  const lock = await breaker.acquire(['resource'], 5000);
+  // Fails immediately with CircuitBreakerOpenError if circuit is open
+  const lock = await redlock.acquire('resource', { ttl: 5000 });
   await doWork();
   await lock.release();
 } catch (error) {
-  if (breaker.isOpen()) {
+  if (error instanceof CircuitBreakerOpenError) {
     // Circuit is open - Redis is likely down
-    // Use fallback mechanism or queue for later
     await fallbackStrategy();
   }
 }
+```
 
 ## Key Features
 
+- **Distributed Mutex**: Redlock-algorithm based distributed locking with quorum consensus
+- **Distributed Semaphore**: N-permit concurrent access control backed by Redis ZSET
+- **CountDownLatch**: Wait for N distributed events before proceeding
+- **Pub/Sub Waiting**: Optional instant lock-release notifications (vs polling)
 - **Multi-instance support**: Pass array of Redis clients for consensus-based locking
 - **Auto-retry**: Built-in retry with exponential backoff and jitter
-- **Lock extension**: Dynamically extend locks for long-running operations
-- **Metrics**: Built-in performance tracking and monitoring
+- **Lock extension**: Dynamically extend locks/permits for long-running operations
+- **Circuit Breaker**: Fault tolerance against Redis failures
+- **Metrics**: Built-in performance tracking and Prometheus export
 - **TypeScript**: Full type definitions with IntelliSense support
 - **Abort signals**: Graceful handling of lock expiration during execution
 
 ## Error Handling
 
 ```typescript
-import RedlockToolkit, { 
-  ResourceLockedError, 
-  LockTimeoutError, 
+import RedlockToolkit, {
+  ResourceLockedError,
+  LockTimeoutError,
   ConsensusError,
+  SemaphoreFullError,
+  PermitExtensionError,
+  LatchExistsError,
+  LatchNotFoundError,
+  LatchTimeoutError,
   RedlockToolkitError
 } from '@trishchuk/redlock-toolkit';
 
 // Comprehensive error handling pattern
 try {
-  const lock = await redlock.acquire(['critical-resource'], 5000);
-  
+  const lock = await redlock.acquire('critical-resource', { ttl: 5000 });
+
   try {
     await performCriticalOperation();
   } finally {
@@ -231,22 +366,24 @@ try {
   if (error instanceof ResourceLockedError) {
     // Another process holds the lock
     console.log('Resource is busy, retrying later...');
-    await scheduleRetry();
   } else if (error instanceof LockTimeoutError) {
     // Failed to acquire lock within the given time and retries
     console.error(`Could not acquire lock after ${error.attemptsCount} attempts.`);
-    await-notify-admin();
   } else if (error instanceof ConsensusError) {
     // Not enough redis instances agreed to grant the lock
     console.error(`Failed to achieve quorum. Required: ${error.requiredQuorum}, got: ${error.achievedVotes}`);
-    await-notify-admin();
+  } else if (error instanceof SemaphoreFullError) {
+    // All permits are taken
+    console.log(`Semaphore full: ${error.activePermits}/${error.maxPermits}`);
+  } else if (error instanceof LatchTimeoutError) {
+    // Latch await timed out
+    console.log(`Latch timed out with ${error.remainingCount} remaining`);
   } else if (error instanceof RedlockToolkitError) {
     // A known error from the library
     console.error('A managed error occurred:', error);
   } else {
     // Unexpected error (network, Redis connection, etc.)
     console.error('System error:', error);
-    await alertOps();
   }
 }
 ```
@@ -254,17 +391,33 @@ try {
 ## Configuration
 
 ```typescript
-const redlock = new Redlock([redis], {
-  // Retry behavior - balance between responsiveness and load
-  retryCount: 3,        // Max attempts (increase for critical operations)
-  retryDelay: 200,      // Base delay between retries in ms
-  retryJitter: 100,     // Random jitter (0-100ms) prevents synchronization
-  
-  // Clock drift compensation (important for distributed systems)
-  driftFactor: 0.01,    // 1% of TTL reserved for clock drift
-  
-  // Automatic extension for long operations
-  automaticExtensionThreshold: 500  // Extend when 500ms remains
+const redlock = new RedlockToolkit({
+  clients: [redis1, redis2, redis3],
+
+  defaultLockOptions: {
+    ttl: 30000,
+    retryCount: 3,        // Max attempts (increase for critical operations)
+    retryDelay: 200,      // Base delay between retries in ms
+    retryJitter: 100,     // Random jitter (0-100ms) prevents synchronization
+    driftFactor: 0.01,    // 1% of TTL reserved for clock drift
+    autoExtendThreshold: 500, // Extend when 500ms remains
+  },
+
+  circuitBreaker: {
+    failureThreshold: 5,
+    resetTimeout: 60000,
+    maxRetries: 3,
+    operationTimeout: 5000,
+  },
+
+  // Pub/Sub: instant notifications instead of polling delays
+  pubSub: {
+    enabled: true,
+    // subscriberClients: [subRedis1, subRedis2, subRedis3],
+  },
+
+  keyPrefix: 'neolock',     // Key prefix in Redis
+  enableMetrics: true,       // Enable performance tracking
 });
 ```
 
@@ -280,23 +433,23 @@ const expectedTime = 2000;  // 2 seconds expected
 const buffer = 1000;         // 1 second buffer
 const ttl = expectedTime + buffer;
 
-await redlock.using(['resource'], ttl, async () => {
+await redlock.using('resource', async () => {
   await operation();
-});
+}, { ttl });
 ```
 
 ### 2. Use Namespace Prefixes
 ```typescript
 // Organize locks with clear namespaces
 const locks = {
-  user: (id) => [`user:${id}:profile`],
-  order: (id) => [`order:${id}:processing`],
-  cache: (key) => [`cache:${key}:update`]
+  user: (id) => `user:${id}:profile`,
+  order: (id) => `order:${id}:processing`,
+  cache: (key) => `cache:${key}:update`
 };
 
-await redlock.using(locks.user(123), 5000, async () => {
+await redlock.using(locks.user(123), async () => {
   await updateUserProfile(123);
-});
+}, { ttl: 5000 });
 ```
 
 ### 3. Handle Lock Contention
@@ -321,26 +474,29 @@ async function withBackoff(fn, maxAttempts = 5) {
 
 // Usage
 await withBackoff(async () => {
-  await redlock.using(['high-contention'], 3000, async () => {
+  await redlock.using('high-contention', async () => {
     await criticalOperation();
-  });
+  }, { ttl: 3000 });
 });
 ```
 
 ### 4. Monitor Lock Metrics
 ```typescript
 // Track lock performance
-redlock.on('acquire', (lock) => {
-  metrics.increment('locks.acquired', { resource: lock.resources[0] });
+redlock.on('lock:acquired', (resources, identifier) => {
+  metrics.increment('locks.acquired', { resource: resources[0] });
 });
 
-redlock.on('release', (lock) => {
-  metrics.histogram('locks.held_time', lock.heldTime);
+redlock.on('lock:released', (resources, identifier) => {
+  metrics.increment('locks.released');
 });
 
-redlock.on('extend', (resources, identifier, timestamp) => {
+redlock.on('lock:extended', (resources, identifier, timestamp) => {
   metrics.increment('locks.extended');
 });
+
+// Export Prometheus metrics
+const prometheusText = redlock.exportMetrics();
 ```
 
 ## Common Patterns
@@ -351,32 +507,68 @@ redlock.on('extend', (resources, identifier, timestamp) => {
 async function processQueueItem(taskId: string) {
   try {
     await redlock.using(
-      [`queue:task:${taskId}`],  // Unique lock per task
-      30000,                      // 30 second timeout for processing
+      `queue:task:${taskId}`,    // Unique lock per task
       async (signal) => {
-        // Mark task as processing in database
         await db.tasks.update(taskId, { status: 'processing' });
-        
-        // Process with abort checking
+
         const result = await processTask(taskId, signal);
-        
-        // Mark complete only if not aborted
+
         if (!signal.aborted) {
-          await db.tasks.update(taskId, { 
+          await db.tasks.update(taskId, {
             status: 'completed',
-            result 
+            result
           });
         }
-      }
+      },
+      { ttl: 30000 }
     );
   } catch (error) {
     if (error instanceof ResourceLockedError) {
-      // Task already being processed by another worker
       console.log(`Task ${taskId} already in progress`);
     } else {
-      // Processing failed - mark for retry
       await db.tasks.update(taskId, { status: 'failed', error });
     }
+  }
+}
+```
+
+### Rate Limiting with Semaphore
+```typescript
+// Limit concurrent external API calls to 10
+async function callExternalApi(request: Request) {
+  const permit = await redlock.acquireSemaphore('external-api', {
+    maxPermits: 10,
+    ttl: 30000,
+    retryCount: 5,
+    retryDelay: 500,
+  });
+
+  try {
+    return await fetch(request);
+  } finally {
+    await permit.release();
+  }
+}
+```
+
+### Multi-Service Coordination with CountDownLatch
+```typescript
+// Wait for all services to be ready before starting
+async function coordinateStartup() {
+  const latch = await redlock.createCountDownLatch('services-ready', {
+    count: 3,
+    ttl: 120000,
+  });
+
+  // Each service calls countDown when initialized
+  // Service A: await latch.countDown('service-a');
+  // Service B: await latch.countDown('service-b');
+  // Service C: await latch.countDown('service-c');
+
+  // Main coordinator waits for all services
+  const allReady = await latch.await(60000);
+  if (allReady) {
+    console.log('All services ready, starting processing');
   }
 }
 ```
@@ -385,29 +577,25 @@ async function processQueueItem(taskId: string) {
 ```typescript
 // Prevent cache stampede during updates
 async function updateCacheWithLock(cacheKey: string) {
-  const lockKey = [`cache:update:${cacheKey}`];
-  
   try {
-    // Short TTL - cache updates should be fast
-    await redlock.using(lockKey, 2000, async () => {
-      // Check if another process already updated
-      const cached = await redis.get(cacheKey);
-      if (cached && Date.now() - cached.timestamp < 1000) {
-        return; // Recently updated, skip
+    await redlock.using(`cache:update:${cacheKey}`, async () => {
+      const raw = await redis.get(cacheKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Date.now() - parsed.timestamp < 1000) {
+          return; // Recently updated, skip
+        }
       }
-      
-      // Fetch fresh data
+
       const data = await fetchFromDatabase();
-      
-      // Update cache with timestamp
+
       await redis.setex(cacheKey, 3600, JSON.stringify({
         data,
         timestamp: Date.now()
       }));
-    });
+    }, { ttl: 2000 });
   } catch (error) {
     if (error instanceof ResourceLockedError) {
-      // Another process is updating - wait and use their result
       await new Promise(r => setTimeout(r, 100));
       return await redis.get(cacheKey);
     }
@@ -416,67 +604,29 @@ async function updateCacheWithLock(cacheKey: string) {
 }
 ```
 
-### Rate Limiting
-```typescript
-// Implement sliding window rate limiting
-async function rateLimitedOperation(userId: string, limit = 10) {
-  const window = 60000; // 1 minute window
-  const lockKey = [`ratelimit:${userId}`];
-  
-  await redlock.using(lockKey, 1000, async () => {
-    const now = Date.now();
-    const windowStart = now - window;
-    
-    // Get requests in current window
-    const requests = await redis.zrangebyscore(
-      `requests:${userId}`,
-      windowStart,
-      now
-    );
-    
-    if (requests.length >= limit) {
-      throw new Error('Rate limit exceeded');
-    }
-    
-    // Add current request
-    await redis.zadd(`requests:${userId}`, now, `${now}:${uuid()}`);
-    
-    // Clean old entries
-    await redis.zremrangebyscore(`requests:${userId}`, 0, windowStart);
-  });
-  
-  // Proceed with operation
-  await performOperation();
-}
-```
-
 ### Database Migrations
 ```typescript
 // Ensure only one instance runs migrations
 async function runMigrations() {
-  const lockKey = ['db:migrations'];
-  const ttl = 300000; // 5 minutes for migrations
-  
   try {
-    await redlock.using(lockKey, ttl, async (signal) => {
+    await redlock.using('db:migrations', async (signal) => {
       console.log('Acquired migration lock, starting migrations...');
-      
-      // Check current version
+
       const currentVersion = await db.getVersion();
       const migrations = await getMigrationsSince(currentVersion);
-      
+
       for (const migration of migrations) {
         if (signal.aborted) {
           throw new Error('Migration lock expired');
         }
-        
+
         console.log(`Running migration: ${migration.version}`);
         await migration.up();
         await db.setVersion(migration.version);
       }
-      
+
       console.log('Migrations completed successfully');
-    });
+    }, { ttl: 300000 }); // 5 minutes for migrations
   } catch (error) {
     if (error instanceof ResourceLockedError) {
       console.log('Migrations already running on another instance');
@@ -505,39 +655,26 @@ const redis = new Redis.Cluster([
 });
 ```
 
-### 2. Batch Operations
+### 2. Enable Pub/Sub for Faster Retry
+```typescript
+// With pub/sub, lock waiters get instant notifications instead of polling
+const redlock = new RedlockToolkit({
+  clients: [redis],
+  pubSub: { enabled: true }, // Uses client.duplicate() automatically
+});
+// Now retrying acquires react immediately when a lock is released
+```
+
+### 3. Batch Operations
 ```typescript
 // Lock multiple resources atomically for batch operations
 await redlock.using(
   ['resource1', 'resource2', 'resource3'], // Multiple locks
-  5000,
   async () => {
-    // All resources locked - safe to perform batch operation
     await batchUpdate();
-  }
+  },
+  { ttl: 5000 }
 );
-```
-
-### 3. Lock-Free Reads
-```typescript
-// Use optimistic patterns for read-heavy workloads
-async function readWithOptimisticLock(key: string) {
-  // Read without lock
-  const data = await redis.get(key);
-  const version = await redis.get(`${key}:version`);
-  
-  // Process data
-  const processed = await processData(data);
-  
-  // Only lock for writes
-  const lock = await optimistic.acquire([key], 1000, version);
-  try {
-    await redis.set(key, processed);
-    await redis.incr(`${key}:version`);
-  } finally {
-    await lock.release();
-  }
-}
 ```
 
 ## Troubleshooting
@@ -563,3 +700,11 @@ async function readWithOptimisticLock(key: string) {
 5. **Memory Leaks from Unreleased Locks**
    - Solution: Always use try/finally or using() pattern
    - Set appropriate TTLs as safety net
+
+6. **Semaphore Permits Not Released**
+   - Solution: Use `permit.using()` for auto-release, or try/finally
+   - `shutdown()` releases all active permits automatically
+
+7. **CountDownLatch Expired Before Completion**
+   - Solution: Increase TTL to cover the maximum expected coordination time
+   - Monitor status with `getStatus()` to detect stalled workers
