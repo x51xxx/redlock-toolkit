@@ -73,11 +73,27 @@ export class ConsensusManager {
       if (votesFor.size + pending.size < quorumSize) break;
     }
 
-    // Consume remaining pending promises to prevent unhandled rejections
-    for (const [, pendingOp] of pending) {
-      pendingOp.catch(() => {
-        // Silently consume errors from abandoned operations after early consensus
-      });
+    const failed = options?.successPolicy === 'any'
+      ? votesFor.size === 0
+      : votesFor.size < quorumSize;
+
+    if (failed) {
+      // On failure every in-flight operation must settle before we report
+      // stats: an abandoned operation may still succeed on its node after
+      // the quorum decision, and the caller's cleanup needs to run after
+      // that side effect has landed, not before. (On success the early exit
+      // stays — the released stragglers are covered by the eventual release,
+      // which always targets all clients.)
+      while (pending.size > 0) {
+        await nextSettlement();
+      }
+    } else {
+      // Consume remaining pending promises to prevent unhandled rejections
+      for (const [, pendingOp] of pending) {
+        pendingOp.catch(() => {
+          // Silently consume errors from abandoned operations after early consensus
+        });
+      }
     }
 
     const stats: LockStats = {

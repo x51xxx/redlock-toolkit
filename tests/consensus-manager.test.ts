@@ -296,28 +296,32 @@ describe('ConsensusManager', () => {
       expect(duration).toBeLessThan(50); // Should not wait for slow operations
     });
 
-    it('should terminate early when quorum impossible', async () => {
+    it('should drain in-flight operations before reporting failure', async () => {
       const clients = createMockRedisClients(5);
       let callCount = 0;
-      
+      let slowSettled = 0;
+
       const operation = vi.fn().mockImplementation(() => {
         callCount++;
         if (callCount <= 3) {
           // 3 fast failures make quorum impossible (need 3 successes for quorum)
           return Promise.reject(new Error('Fast failure'));
         }
-        // These will be slow but should not be waited for
-        return new Promise(resolve => setTimeout(() => resolve(1), 100));
+        // Slow operations that may still succeed on their nodes
+        return new Promise(resolve => setTimeout(() => {
+          slowSettled++;
+          resolve(1);
+        }, 100));
       });
 
-      const startTime = Date.now();
-      
       await expect(
         consensusManager.execute(clients, operation, {})
       ).rejects.toThrow(ConsensusError);
-      
-      const duration = Date.now() - startTime;
-      expect(duration).toBeLessThan(50); // Should fail fast
+
+      // On failure the consensus MUST wait for in-flight operations: an
+      // abandoned operation may still succeed on its node, and the caller's
+      // cleanup has to run after that side effect has landed (audit FIX #6).
+      expect(slowSettled).toBe(2);
     });
   });
 

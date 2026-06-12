@@ -100,7 +100,10 @@ export class CountDownLatchStrategy {
 
       return response[2]; // status code
     }, undefined, {
-      successPolicy: "any" as const,
+      // Must be quorum, like every other latch operation: with "any" a single
+      // node could advance the latch while the majority did not, leaving the
+      // distributed count permanently inconsistent across nodes.
+      successPolicy: "quorum" as const,
       evaluateResult: (res: unknown) => typeof res === "number" && res !== 0,
     });
 

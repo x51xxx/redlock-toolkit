@@ -36,6 +36,29 @@ export interface OptimisticLockResult extends OptimisticResource {
 }
 
 /**
+ * Lua script to roll back a write that succeeded on a minority of nodes.
+ * Only reverts if the version is exactly the one our failed write produced
+ * (expected + 1) — an unconditional DECR could corrupt a version that
+ * another client has since written. For a first write (expected version 0)
+ * the keys it created are deleted outright. Note: for non-first writes the
+ * previous value cannot be restored (it is unknown), only the version is.
+ * Exported for regression tests.
+ */
+export const ROLLBACK_WRITE_SCRIPT = `
+  local currentVersion = redis.call("GET", KEYS[1] .. ":version")
+  if currentVersion and tonumber(currentVersion) == tonumber(ARGV[1]) + 1 then
+    if tonumber(ARGV[1]) == 0 then
+      redis.call("DEL", KEYS[1])
+      redis.call("DEL", KEYS[1] .. ":version")
+    else
+      redis.call("DECR", KEYS[1] .. ":version")
+    end
+    return 1
+  end
+  return 0
+`;
+
+/**
  * Lua script for optimistic read with version
  * Returns [value, version] or nil if not exists
  */
@@ -53,14 +76,14 @@ const OPTIMISTIC_READ_SCRIPT = `
  * Lua script for optimistic write with version check
  * Only updates if version matches, increments version on success
  */
-const OPTIMISTIC_WRITE_SCRIPT = `
+export const OPTIMISTIC_WRITE_SCRIPT = `
   local currentVersion = redis.call("GET", KEYS[1] .. ":version")
   
   -- First write (no version exists)
   if not currentVersion and ARGV[2] == "0" then
     redis.call("SET", KEYS[1], ARGV[1])
     redis.call("SET", KEYS[1] .. ":version", "1")
-    if ARGV[3] then
+    if ARGV[3] and ARGV[3] ~= "" then
       redis.call("PEXPIRE", KEYS[1], ARGV[3])
       redis.call("PEXPIRE", KEYS[1] .. ":version", ARGV[3])
     end
@@ -72,7 +95,7 @@ const OPTIMISTIC_WRITE_SCRIPT = `
     local newVersion = tostring(tonumber(currentVersion) + 1)
     redis.call("SET", KEYS[1], ARGV[1])
     redis.call("SET", KEYS[1] .. ":version", newVersion)
-    if ARGV[3] then
+    if ARGV[3] and ARGV[3] ~= "" then
       redis.call("PEXPIRE", KEYS[1], ARGV[3])
       redis.call("PEXPIRE", KEYS[1] .. ":version", ARGV[3])
     end
@@ -87,14 +110,14 @@ const OPTIMISTIC_WRITE_SCRIPT = `
  * Lua script for compare-and-swap operation
  * Atomically swaps value if current value matches expected
  */
-const COMPARE_AND_SWAP_SCRIPT = `
+export const COMPARE_AND_SWAP_SCRIPT = `
   local current = redis.call("GET", KEYS[1])
   if current == ARGV[1] then
     redis.call("SET", KEYS[1], ARGV[2])
     local version = redis.call("GET", KEYS[1] .. ":version") or "0"
     local newVersion = tostring(tonumber(version) + 1)
     redis.call("SET", KEYS[1] .. ":version", newVersion)
-    if ARGV[3] then
+    if ARGV[3] and ARGV[3] ~= "" then
       redis.call("PEXPIRE", KEYS[1], ARGV[3])
       redis.call("PEXPIRE", KEYS[1] .. ":version", ARGV[3])
     end
@@ -341,6 +364,13 @@ export class OptimisticRedlock extends Redlock {
       return results.find((r) => r !== null) || null;
     }
 
+    // Sub-quorum write: a minority of nodes accepted the new version. Without
+    // a rollback they would stay at expected+1 while the rest stay at
+    // expected, and no future expectedVersion could ever satisfy a quorum.
+    if (successCount > 0) {
+      await this.rollbackWrite(resource, expectedVersion);
+    }
+
     return null;
   }
 
@@ -374,6 +404,13 @@ export class OptimisticRedlock extends Redlock {
 
     if (successCount >= quorum) {
       return results.find((r) => r !== null) || null;
+    }
+
+    // Sub-quorum CAS: roll back the minority that bumped the version.
+    // The version our write produced is known from any successful node.
+    const newVersion = results.find((r) => r !== null);
+    if (newVersion !== null && newVersion !== undefined) {
+      await this.rollbackWrite(resource, newVersion - 1);
     }
 
     return null;
@@ -504,23 +541,19 @@ export class OptimisticRedlock extends Redlock {
   }
 
   /**
-   * Rollback write operation
+   * Roll back a write that succeeded on a minority of nodes.
+   * Guarded in Lua: only reverts a version equal to expected + 1, so a
+   * version written by another client in the meantime is left untouched.
    */
   private async rollbackWrite(
     resource: string,
     version: number,
   ): Promise<void> {
-    // Attempt to restore previous version on all nodes
     await Promise.all(
       this.clients.map(async (client) => {
         try {
           await client.eval(
-            `
-            local currentVersion = redis.call("GET", KEYS[1] .. ":version")
-            if currentVersion and tonumber(currentVersion) > tonumber(ARGV[1]) then
-              redis.call("DECR", KEYS[1] .. ":version")
-            end
-          `,
+            ROLLBACK_WRITE_SCRIPT,
             1,
             resource,
             version.toString(),

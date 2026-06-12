@@ -148,7 +148,12 @@ export class PubSubManager extends EventEmitter {
 
     return new Promise<string | null>((resolve) => {
       let resolved = false;
-      const onMessage: ((message: string) => void) | undefined;
+      // Must be `let`: it's declared here but only ASSIGNED below (the handler closes over `timer`
+      // and `localCleanup`, which don't exist yet), so an initialized `const` is impossible (TS
+      // 1155/2588). `localCleanup` only reads it from callbacks that run after assignment, so the
+      // forward reference is safe. prefer-const can't see the deferred assignment — silence it.
+      // eslint-disable-next-line prefer-const
+      let onMessage: ((message: string) => void) | undefined;
 
       // Remove listener from local Set synchronously to prevent memory leak
       // even if the async Redis UNSUBSCRIBE call fails.

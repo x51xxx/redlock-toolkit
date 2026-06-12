@@ -307,12 +307,16 @@ local baseVersion = 0
 if expectedVersion then
     baseVersion = expectedVersion
 else
-    -- If version already exists but no expectedVersion was provided,
-    -- this is a conflict - the caller must provide expectedVersion for existing resources
-    local firstVersionKey = KEYS[1] .. ':version'
-    local existingVersion = redis.call('GET', firstVersionKey)
-    if existingVersion then
-        return {0, tonumber(existingVersion) or 0, 'version_required'}
+    -- If a version already exists on ANY key but no expectedVersion was
+    -- provided, this is a conflict - the caller must provide expectedVersion
+    -- for existing resources. Checking only the first key would silently
+    -- overwrite existing versions on the remaining keys.
+    for i = 1, #KEYS do
+        local versionKey = KEYS[i] .. ':version'
+        local existingVersion = redis.call('GET', versionKey)
+        if existingVersion then
+            return {0, tonumber(existingVersion) or 0, 'version_required'}
+        end
     end
 end
 local newVersion = baseVersion + 1

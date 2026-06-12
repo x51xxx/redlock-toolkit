@@ -282,8 +282,11 @@ export class InternalRedlock extends EventEmitter {
       });
     }
 
-    // Extension failed - try to release on all clients
-    await this.forceRelease(lock);
+    // Extension failed - release our own hold on all clients.
+    // Must NOT force-delete: the lock may already belong to another owner
+    // (the most likely reason extension lost quorum), and an unconditional
+    // DEL would destroy their lock. release() is ownership-checked in Lua.
+    await this.release(lock);
     throw new Error("Failed to extend lock - quorum not achieved");
   }
 
@@ -307,7 +310,11 @@ export class InternalRedlock extends EventEmitter {
   }
 
   /**
-   * Force release a lock (without ownership check)
+   * Force release a lock (without ownership check).
+   *
+   * DANGER: this deletes the lock keys unconditionally, even if the lock is
+   * currently held by a different owner. Never call this automatically;
+   * it exists only for manual operator intervention.
    */
   async forceRelease(lock: InternalRedlockLock): Promise<void> {
     const promises = this.clients.map(async (client) => {
@@ -381,14 +388,16 @@ export class InternalRedlock extends EventEmitter {
       };
     }
 
-    // Failed to acquire quorum - release locks on successful clients
-    const releasePromises = this.clients.map(async (client, index) => {
-      if (results[index]) {
-        try {
-          await this.executeScript(client, RELEASE_SCRIPT, resources, [value]);
-        } catch {
-          // Ignore release errors
-        }
+    // Failed to acquire quorum - release on ALL clients, per the Redlock
+    // spec. A node where acquire "failed" may still have executed the SET
+    // (e.g. the ack was lost in a partition), so skipping it would leak the
+    // lock there until TTL. The release script is ownership-checked, so it
+    // is a safe no-op on nodes that never stored our value.
+    const releasePromises = this.clients.map(async (client) => {
+      try {
+        await this.executeScript(client, RELEASE_SCRIPT, resources, [value]);
+      } catch {
+        // Ignore release errors
       }
     });
 

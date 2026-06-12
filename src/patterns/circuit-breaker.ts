@@ -15,6 +15,8 @@ export type CircuitState = "closed" | "open" | "half-open";
 export class CircuitBreaker extends EventEmitter {
   private state: CircuitState = "closed";
   private failureCount = 0;
+  private consecutiveFailures = 0;
+  private halfOpenProbes = 0;
   private lastFailureTime?: number;
   private lastOpenTime?: number;
   private successCount = 0;
@@ -65,6 +67,20 @@ export class CircuitBreaker extends EventEmitter {
         this.failureCount,
         { state: this.state },
       );
+    }
+
+    // In half-open state only a bounded number of probes (maxRetries, min 1)
+    // may be in flight: without this gate every concurrent caller arriving
+    // after resetTimeout becomes a probe and floods the recovering target.
+    if (this.state === "half-open") {
+      if (this.halfOpenProbes >= Math.max(1, this.options.maxRetries)) {
+        throw new CircuitBreakerOpenError(
+          this.lastFailureTime!,
+          this.failureCount,
+          { state: this.state, reason: "half-open probe limit reached" },
+        );
+      }
+      this.halfOpenProbes++;
     }
 
     this.totalOperations++;
@@ -122,6 +138,11 @@ export class CircuitBreaker extends EventEmitter {
     if (this.state === "half-open") {
       // Reset circuit after successful operation in half-open state
       this.reset();
+    } else if (this.state === "closed") {
+      // A success closes the failure window: only CONSECUTIVE failures may
+      // trip the circuit, otherwise old failures accumulate forever and a
+      // single new failure after a long healthy streak opens the circuit.
+      this.consecutiveFailures = 0;
     }
   }
 
@@ -130,13 +151,14 @@ export class CircuitBreaker extends EventEmitter {
    */
   private onFailure(error: Error): void {
     this.failureCount++;
+    this.consecutiveFailures++;
     this.lastFailureTime = Date.now();
 
     this.emit("failure", error, this.getMetrics());
 
     if (
       this.state === "closed" &&
-      this.failureCount >= this.options.failureThreshold
+      this.consecutiveFailures >= this.options.failureThreshold
     ) {
       this.openCircuit();
     } else if (this.state === "half-open") {
@@ -152,6 +174,7 @@ export class CircuitBreaker extends EventEmitter {
     const previousState = this.state;
     this.state = "open";
     this.lastOpenTime = Date.now();
+    this.halfOpenProbes = 0;
 
     this.emit("stateChanged", this.state, previousState, this.getMetrics());
   }
@@ -163,6 +186,8 @@ export class CircuitBreaker extends EventEmitter {
     const previousState = this.state;
     this.state = "closed";
     this.failureCount = 0;
+    this.consecutiveFailures = 0;
+    this.halfOpenProbes = 0;
     this.successCount = 0;
     this.totalOperations = 0;
     this.lastFailureTime = undefined;

@@ -8,13 +8,25 @@ import RedlockToolkit from '../src/index';
 import type { RedlockToolkitConfig } from '../src/core/types';
 
 /**
- * Check if Redis is reachable on localhost:6379.
+ * Test Redis target. Defaults to localhost:6379 (unchanged behavior), but each piece is
+ * env-overridable so the FLUSHDB-heavy integration tests can be pointed at a DISPOSABLE instance
+ * instead of a shared dev Redis:
+ *   REDLOCK_TEST_REDIS_HOST  (default "localhost")
+ *   REDLOCK_TEST_REDIS_PORT  (default 6379)
+ *   REDLOCK_TEST_REDIS_DB    (default 0 — base db index; multi-client tests use db..db+count-1)
+ */
+const TEST_HOST = process.env.REDLOCK_TEST_REDIS_HOST ?? 'localhost';
+const TEST_PORT = Number(process.env.REDLOCK_TEST_REDIS_PORT) || 6379;
+const TEST_DB_BASE = Number(process.env.REDLOCK_TEST_REDIS_DB) || 0;
+
+/**
+ * Check if the (configured) Redis is reachable.
  */
 export async function isRedisAvailable(): Promise<boolean> {
   const client = new Redis({
-    host: 'localhost',
-    port: 6379,
-    db: 0,
+    host: TEST_HOST,
+    port: TEST_PORT,
+    db: TEST_DB_BASE,
     lazyConnect: true,
     connectTimeout: 1000,
     maxRetriesPerRequest: 0,
@@ -33,14 +45,14 @@ export async function isRedisAvailable(): Promise<boolean> {
 }
 
 /**
- * Create `count` ioredis clients on localhost:6379 with db indices 0..count-1.
+ * Create `count` ioredis clients on the configured host/port with db indices base..base+count-1.
  */
 export function createRedisClients(count: number): Redis[] {
   return Array.from({ length: count }, (_, i) =>
     new Redis({
-      host: 'localhost',
-      port: 6379,
-      db: i,
+      host: TEST_HOST,
+      port: TEST_PORT,
+      db: TEST_DB_BASE + i,
       maxRetriesPerRequest: 3,
     }),
   );

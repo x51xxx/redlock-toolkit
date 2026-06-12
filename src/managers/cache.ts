@@ -73,6 +73,16 @@ export class CacheManager {
   }
 
   /**
+   * Invalidate the cache entry for a resource set. Must be called whenever
+   * the lock is released, otherwise a stale 'acquired' entry survives until
+   * its TTL and misreports the lock as held.
+   */
+  invalidate(resources: string[]): void {
+    if (!this.cacheEnabled) return;
+    this.lockCache.delete(resources.join(':'));
+  }
+
+  /**
    * Evict cache entries based on strategy
    */
   private evict(): void {

@@ -36,7 +36,7 @@ export interface CircuitBreakerOptions {
   failureThreshold?: number;
   /** Reset timeout in milliseconds */
   resetTimeout?: number;
-  /** Maximum number of retries when circuit is half-open */
+  /** Maximum number of probe operations allowed in flight while the circuit is half-open (min 1) */
   maxRetries?: number;
   /** Timeout for individual operations */
   operationTimeout?: number;
@@ -231,6 +231,8 @@ export interface OptimisticLockResult {
   conflict?: boolean;
   /** Number of retries performed */
   retries?: number;
+  /** Identifier written to Redis by the acquire script (needed to extend/release the lock) */
+  identifier?: string;
 }
 
 /**

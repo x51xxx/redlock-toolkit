@@ -25,6 +25,7 @@ export class Lock {
   private _expiration: number;
   private _extensions = 0;
   private _released = false;
+  private _releasePromise: Promise<LockReleaseResult> | null = null;
   private readonly acquisitionTime = Date.now();
   private autoExtensionManager?: AutoExtensionManager;
 
@@ -166,9 +167,25 @@ export class Lock {
       };
     }
 
-    const result = await this.lockManager.release(this, options);
-    this._released = true; // Mark as released even if partially successful
-    return result;
+    // Serialize concurrent releases: only the first call performs the Redis
+    // round-trip, the others share its outcome. Without this a concurrent
+    // second release reaches Redis after the keys are already gone, sees 0
+    // deletions and becomes indistinguishable from a stolen lock.
+    if (!this._releasePromise) {
+      this._releasePromise = (async () => {
+        try {
+          const result = await this.lockManager.release(this, options);
+          this._released = true; // Mark as released even if partially successful
+          return result;
+        } catch (error) {
+          // Allow a retry after a failed release attempt
+          this._releasePromise = null;
+          throw error;
+        }
+      })();
+    }
+
+    return this._releasePromise;
   }
 
   /**

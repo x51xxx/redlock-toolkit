@@ -243,7 +243,9 @@ describe('Lua Scripts', () => {
         
         // Should avoid excessive nested loops (reasonable complexity)
         const forLoopCount = (source.match(/for /g) || []).length;
-        expect(forLoopCount).toBeLessThanOrEqual(4); // Allow reasonable complexity for multi-key operations
+        // 5 sequential (not nested) loops: optimisticAcquire validates
+        // constraints, checks versions on all keys, then writes
+        expect(forLoopCount).toBeLessThanOrEqual(5);
       });
     });
 

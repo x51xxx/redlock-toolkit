@@ -30,6 +30,7 @@ import {
   RedisOperationError,
   OptimisticLockConflictError,
   HybridLockError,
+  LockValidationError,
   isRetryableError,
   getRetryDelay,
 } from "./core/errors";
@@ -154,7 +155,28 @@ export class RedlockToolkit extends EventEmitter implements ILockToolkit {
     );
 
     this.setupEventForwarding();
+    this.warnIfClusterClients();
     this.preloadScripts();
+  }
+
+  /**
+   * Lua scripts in this library access keys derived inside the script
+   * (e.g. `key .. ':version'`) and accept multiple arbitrary KEYS. On Redis
+   * Cluster both patterns fail with CROSSSLOT unless every resource name
+   * carries an explicit hash tag (e.g. `{order:42}`) so that all related
+   * keys land in the same slot. Warn loudly instead of failing at runtime.
+   */
+  private warnIfClusterClients(): void {
+    const hasCluster = this.clients.some(
+      (client) => (client as { isCluster?: boolean }).isCluster === true,
+    );
+    if (hasCluster) {
+      this.logger.warn(
+        "Redis Cluster client detected: multi-resource locks and optimistic " +
+          "operations require hash-tagged resource names (e.g. '{order:42}') " +
+          "to keep all derived keys in one slot; otherwise commands fail with CROSSSLOT.",
+      );
+    }
   }
 
   /**
@@ -373,25 +395,26 @@ export class RedlockToolkit extends EventEmitter implements ILockToolkit {
       };
     } catch (error) {
       if (error instanceof ConsensusError && cleanupContext) {
-        const stats = await error.attempts[0];
-        const votesFor = stats.votesFor;
-        if (votesFor.size > 0) {
-          const cleanupScript = cleanupContext.script ?? SCRIPTS.release;
-          const cleanupArgs = cleanupContext.args ?? [cleanupContext.identifier];
-          const cleanupPromises = Array.from(votesFor).map(client =>
-            this.circuitBreaker.execute(this.getClientId(client), () =>
-              client.eval(
-                cleanupScript.source,
-                cleanupContext.keys.length,
-                ...cleanupContext.keys,
-                ...cleanupArgs
-              )
-            ).catch((err) => {
-              this.logger.warn("Consensus cleanup failed", { clientId: this.getClientId(client), error: String(err) });
-            })
-          );
-          await Promise.all(cleanupPromises);
-        }
+        // Clean up on ALL clients, not only confirmed voters: an operation
+        // abandoned by the early-exit consensus loop (or one whose ack was
+        // lost) may still have succeeded on its node after the quorum
+        // decision. The cleanup script is ownership-checked, so it is a safe
+        // no-op on nodes that never stored our value.
+        const cleanupScript = cleanupContext.script ?? SCRIPTS.release;
+        const cleanupArgs = cleanupContext.args ?? [cleanupContext.identifier];
+        const cleanupPromises = this.clients.map(client =>
+          this.circuitBreaker.execute(this.getClientId(client), () =>
+            client.eval(
+              cleanupScript.source,
+              cleanupContext.keys.length,
+              ...cleanupContext.keys,
+              ...cleanupArgs
+            )
+          ).catch((err) => {
+            this.logger.warn("Consensus cleanup failed", { clientId: this.getClientId(client), error: String(err) });
+          })
+        );
+        await Promise.all(cleanupPromises);
       }
       // Re-throw the original error
       throw error;
@@ -488,7 +511,15 @@ export class RedlockToolkit extends EventEmitter implements ILockToolkit {
     options: HybridLockOptions,
   ): Lock {
     const resourceList = Array.isArray(resources) ? resources : [resources];
-    const identifier = this.generateIdentifier();
+    if (!result.identifier) {
+      throw new LockValidationError(
+        "identifier",
+        "identifier written by the optimistic acquire script",
+        undefined,
+        { resources: resourceList },
+      );
+    }
+    const identifier = result.identifier;
     const expiration = Date.now() + (options.ttl || this.defaultOptions.ttl);
 
     const lock = new Lock(
@@ -591,15 +622,48 @@ export class RedlockToolkit extends EventEmitter implements ILockToolkit {
     const startTime = Date.now();
     const keys = lock.resources.map((r) => this.generateLockKey(r));
 
+    // The release script returns the number of keys actually deleted; 0 means
+    // the lock was not held by this identifier (expired or taken by another
+    // owner). Treating 0 as success would mask lock theft, so only res > 0
+    // counts as a successful vote. Nodes that definitively answer 0 are
+    // tracked separately to distinguish "not held" from infrastructure errors.
+    const quorum = Math.floor(this.clients.length / 2) + 1;
+    let notHeldVotes = 0;
+
     try {
-      const result = await this.executeWithConsensus(async (client) => {
-        return this.executeScript(client, SCRIPTS.release, keys, [
-          lock.identifier,
-        ]);
-      }, undefined, { evaluateResult: (res: any) => typeof res === 'number' ? res >= 0 : true });
+      let result: LockExecutionResult;
+      try {
+        result = await this.executeWithConsensus(async (client) => {
+          return this.executeScript(client, SCRIPTS.release, keys, [
+            lock.identifier,
+          ]);
+        }, undefined, {
+          evaluateResult: (res: any) => {
+            if (res === 0) notHeldVotes++;
+            return typeof res === 'number' ? res > 0 : true;
+          },
+        });
+      } catch (consensusError) {
+        if (consensusError instanceof ConsensusError && notHeldVotes >= quorum) {
+          // Majority of nodes report the lock was not held — the lock expired
+          // or was acquired by another owner. Not an infrastructure failure,
+          // but the caller must know mutual exclusion was not maintained.
+          this.activeLocks.delete(lock.identifier);
+          this.cacheManager.invalidate(lock.resources);
+          this.metrics.recordLockReleased(lock.identifier, Date.now() - startTime);
+          return {
+            success: false,
+            releasedCount: 0,
+            totalClients: this.clients.length,
+            stats: consensusError.attempts[0],
+          };
+        }
+        throw consensusError;
+      }
 
       // Remove from active locks regardless of success
       this.activeLocks.delete(lock.identifier);
+      this.cacheManager.invalidate(lock.resources);
       this.metrics.recordLockReleased(lock.identifier, Date.now() - startTime);
 
       // Notify waiters via pub/sub (fire-and-forget)
@@ -612,9 +676,10 @@ export class RedlockToolkit extends EventEmitter implements ILockToolkit {
         }
       }
 
+      const stats = await result.attempts[0];
       return {
         success: result.success,
-        releasedCount: this.clients.length, // We consider idempotent releases as success across clients
+        releasedCount: stats.votesFor.size,
         totalClients: this.clients.length,
         stats: result.attempts[0],
       };
@@ -633,6 +698,36 @@ export class RedlockToolkit extends EventEmitter implements ILockToolkit {
   ): Promise<T> {
     const lock = await this.acquire(resources, options);
     return lock.using(routine, options);
+  }
+
+  /**
+   * Backward-compatibility shim for the pre-refactor API (≤0.9.x): `acquireRedlock(resources, ttl,
+   * options?)`. Identical to {@link acquire} but takes TTL as a POSITIONAL argument (the old
+   * Redlock-named signature). The positional `ttl` wins over any `options.ttl`. Delegates to the
+   * pessimistic strategy, which is mutually exclusive — verified by the exclusivity regression test.
+   * Returns a {@link Lock} (the old `RedlockLock` class was folded into `Lock` by the refactor; both
+   * expose `release()`/`extend()`).
+   */
+  async acquireRedlock(
+    resources: string | string[],
+    ttl: number,
+    options?: Partial<LockOptions>,
+  ): Promise<Lock> {
+    return this.acquire(resources, { ...options, ttl });
+  }
+
+  /**
+   * Backward-compatibility shim for `usingRedlock(resources, ttl, routine, options?)` (≤0.9.x).
+   * Same as {@link using} but with TTL positional. The routine receives the auto-extension
+   * {@link LockSignal} (AbortSignal-shaped: `aborted` + `addEventListener('abort', …)`).
+   */
+  async usingRedlock<T>(
+    resources: string | string[],
+    ttl: number,
+    routine: (signal: LockSignal) => Promise<T>,
+    options?: Partial<LockOptions>,
+  ): Promise<T> {
+    return this.using(resources, routine, { ...options, ttl });
   }
 
   /**

@@ -31,8 +31,11 @@ export class OptimisticLockStrategy {
 
   async acquire(resources: string[], options: OptimisticLockOptions = {}): Promise<OptimisticLockResult> {
     const opts = { ...this.toolkit.defaultOptions, ...options };
-    const identifier = (options && Object.prototype.hasOwnProperty.call(options, 'identifier'))
-      ? (options.identifier as string)
+    // An empty identifier (the defaultOptions placeholder) must never reach
+    // Redis: every lock written with '' would match every other one in the
+    // ownership checks. Treat it as "not provided" and generate a real token.
+    const identifier = (options?.identifier && options.identifier !== '')
+      ? options.identifier
       : (opts.identifier || this.toolkit.generateIdentifier());
     const keys = resources.map((r) => this.toolkit.generateLockKey(r));
 
@@ -67,6 +70,7 @@ export class OptimisticLockStrategy {
         success: true,
         currentVersion: opts.expectedVersion ? (opts.expectedVersion + 1) : 1,
         retries: 0,
+        identifier,
       };
     } catch (error) {
       if (error instanceof OptimisticLockConflictError) {
@@ -83,8 +87,11 @@ export class OptimisticLockStrategy {
 
   async update(resources: string[], expectedVersion: number, options: OptimisticLockOptions = {}): Promise<OptimisticLockResult> {
     const opts = { ...this.toolkit.defaultOptions, ...options };
-    const identifier = (options && Object.prototype.hasOwnProperty.call(options, 'identifier'))
-      ? (options.identifier as string)
+    // An empty identifier (the defaultOptions placeholder) must never reach
+    // Redis: every lock written with '' would match every other one in the
+    // ownership checks. Treat it as "not provided" and generate a real token.
+    const identifier = (options?.identifier && options.identifier !== '')
+      ? options.identifier
       : (opts.identifier || this.toolkit.generateIdentifier());
     const keys = resources.map((r) => this.toolkit.generateLockKey(r));
 
@@ -117,6 +124,7 @@ export class OptimisticLockStrategy {
         success: true,
         currentVersion: expectedVersion + 1,
         retries: 0,
+        identifier,
       };
     } catch (error) {
       if (error instanceof OptimisticLockConflictError) {
