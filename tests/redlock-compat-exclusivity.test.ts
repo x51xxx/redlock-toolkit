@@ -22,7 +22,9 @@ describe.skipIf(!available)('Mutual exclusion + Redlock-named compat shims', () 
   let toolkit: RedlockToolkit;
 
   beforeEach(async () => {
-    clients = createRedisClients(1);
+    // db 15: keep this suite's flushdb away from real-redis.test.ts (dbs 0..2),
+    // which runs in a parallel vitest worker against the same Redis instance.
+    clients = createRedisClients(1, 15);
     await flushClients(clients);
     // retryCount 0 ⇒ a contended acquire fails instantly: the cleanest exclusivity discriminator.
     toolkit = new RedlockToolkit({

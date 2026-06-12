@@ -46,13 +46,15 @@ export async function isRedisAvailable(): Promise<boolean> {
 
 /**
  * Create `count` ioredis clients on the configured host/port with db indices base..base+count-1.
+ * Pass a distinct `dbBase` per test FILE: suites run in parallel vitest workers, and a flushdb
+ * from one file wipes another file's locks mid-test if they share a database index.
  */
-export function createRedisClients(count: number): Redis[] {
+export function createRedisClients(count: number, dbBase: number = TEST_DB_BASE): Redis[] {
   return Array.from({ length: count }, (_, i) =>
     new Redis({
       host: TEST_HOST,
       port: TEST_PORT,
-      db: TEST_DB_BASE + i,
+      db: dbBase + i,
       maxRetriesPerRequest: 3,
     }),
   );

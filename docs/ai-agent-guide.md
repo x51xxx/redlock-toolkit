@@ -111,7 +111,7 @@ interface OptimisticLockOptions extends LockOptions {
 
 ## Installation
 ```bash
-npm install @trishchuk/redlock-toolkit
+pnpm install @trishchuk/redlock-toolkit
 ```
 
 ## Basic Usage

@@ -19,6 +19,8 @@ Advanced Redis distributed locking library for Node.js/TypeScript. Implements th
 
 ```bash
 npm install @trishchuk/redlock-toolkit
+# or
+pnpm add @trishchuk/redlock-toolkit
 ```
 
 **Requirements:** Node.js >= 18, Redis 3.2+, ioredis 4.x or 5.x
@@ -196,17 +198,17 @@ interface RedlockToolkitConfig {
 ## Testing
 
 ```bash
-npm test               # Watch mode
-npm run test:run       # Single run
-npm run test:coverage  # Coverage report
+pnpm test               # Watch mode
+pnpm run test:run       # Single run
+pnpm run test:coverage  # Coverage report
 ```
 
 ## Examples
 
 ```bash
-npx tsx examples/simple-demo.ts
-npx tsx examples/basic-usage.ts
-npx tsx examples/advanced-features.ts
+pnpm tsx examples/simple-demo.ts
+pnpm tsx examples/basic-usage.ts
+pnpm tsx examples/advanced-features.ts
 ```
 
 ## Documentation
@@ -225,9 +227,9 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 ```bash
 git clone https://github.com/x51xxx/redlock-toolkit.git
 cd redlock-toolkit
-npm install
-npm test
-npm run build
+pnpm install
+pnpm test
+pnpm run build
 ```
 
 ## License

@@ -10,33 +10,33 @@ redlock-toolkit is an advanced Redis distributed locking library implementing th
 
 ### Build & Development
 ```bash
-npm run build          # Compile TypeScript to dist/ using tsconfig.build.json
-npm run build:watch    # Watch mode compilation
-npm run lint           # Run ESLint on src/**/*.ts
-npm run lint:fix       # Fix linting issues
-npm run format         # Format code with Prettier
+pnpm run build          # Compile TypeScript to dist/ using tsconfig.build.json
+pnpm run build:watch    # Watch mode compilation
+pnpm run lint           # Run ESLint on src/**/*.ts
+pnpm run lint:fix       # Fix linting issues
+pnpm run format         # Format code with Prettier
 ```
 
 ### Testing
 ```bash
-npm test               # Run Vitest in watch mode
-npm run test:run       # Single test run (all tests)
-npm run test:coverage  # Generate coverage report
-npm run test:ui        # Open Vitest UI
+pnpm test               # Run Vitest in watch mode
+pnpm run test:run       # Single test run (all tests)
+pnpm run test:coverage  # Generate coverage report
+pnpm run test:ui        # Open Vitest UI
 
 # Run specific test file
-npx vitest run tests/circuit-breaker.test.ts
+pnpm vitest run tests/circuit-breaker.test.ts
 
 # Run tests matching pattern
-npx vitest run -t "should acquire lock"
+pnpm vitest run -t "should acquire lock"
 ```
 
 ### Examples
 ```bash
-npm run example        # Run basic usage example
-npx tsx examples/basic-usage.ts
-npx tsx examples/simple-demo.ts
-npx tsx examples/advanced-features.ts
+pnpm run example        # Run basic usage example
+pnpm tsx examples/basic-usage.ts
+pnpm tsx examples/simple-demo.ts
+pnpm tsx examples/advanced-features.ts
 ```
 
 ## Architecture Overview

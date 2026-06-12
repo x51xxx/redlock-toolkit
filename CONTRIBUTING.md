@@ -12,7 +12,7 @@ By participating in this project, you agree to maintain a respectful and inclusi
 
 - Node.js >= 18.0.0
 - Redis >= 3.2 (for Lua script support)
-- npm >= 8.0.0
+- pnpm >= 10
 
 ### Development Setup
 
@@ -21,7 +21,7 @@ By participating in this project, you agree to maintain a respectful and inclusi
    ```bash
    git clone https://github.com/<your-username>/redlock-toolkit.git
    cd redlock-toolkit
-   npm install
+   pnpm install
    ```
 
 2. Start a local Redis instance (required for integration tests):
@@ -33,33 +33,33 @@ By participating in this project, you agree to maintain a respectful and inclusi
 3. Verify your setup:
 
    ```bash
-   npm run build
-   npm run test:run
-   npm run lint
+   pnpm run build
+   pnpm run test:run
+   pnpm run lint
    ```
 
 ### Development Commands
 
 ```bash
 # Build
-npm run build              # Compile TypeScript to dist/
-npm run build:watch        # Watch mode compilation
+pnpm run build              # Compile TypeScript to dist/
+pnpm run build:watch        # Watch mode compilation
 
 # Testing
-npm test                   # Run Vitest in watch mode
-npm run test:run           # Single test run (all tests)
-npm run test:coverage      # Generate coverage report
-npm run test:ui            # Open Vitest UI
-npx vitest run tests/circuit-breaker.test.ts   # Run specific test file
+pnpm test                   # Run Vitest in watch mode
+pnpm run test:run           # Single test run (all tests)
+pnpm run test:coverage      # Generate coverage report
+pnpm run test:ui            # Open Vitest UI
+pnpm vitest run tests/circuit-breaker.test.ts   # Run specific test file
 
 # Code quality
-npm run lint               # Run ESLint
-npm run lint:fix           # Auto-fix lint issues
-npm run format             # Format with Prettier
+pnpm run lint               # Run ESLint
+pnpm run lint:fix           # Auto-fix lint issues
+pnpm run format             # Format with Prettier
 
 # Examples
-npm run example            # Run basic usage example
-npx tsx examples/simple-demo.ts
+pnpm run example            # Run basic usage example
+pnpm tsx examples/simple-demo.ts
 ```
 
 ### Project Structure
@@ -132,9 +132,9 @@ reproduce().catch(console.error);
 4. Verify everything passes:
 
    ```bash
-   npm run build
-   npm run test:run
-   npm run lint
+   pnpm run build
+   pnpm run test:run
+   pnpm run lint
    ```
 
 5. Commit using [Conventional Commits](https://www.conventionalcommits.org/):
@@ -223,11 +223,11 @@ Most tests use mocked Redis clients and require no running Redis instance. Integ
 docker run -d --name redis-test -p 6379:6379 redis:7-alpine
 
 # Run only unit tests (no Redis needed)
-npx vitest run --exclude 'tests/real-redis*'
+pnpm vitest run --exclude 'tests/real-redis*'
 
 # Run integration tests (Redis required)
-npx vitest run tests/real-redis.test.ts
-npx vitest run tests/real-redis-semaphore-latch.test.ts
+pnpm vitest run tests/real-redis.test.ts
+pnpm vitest run tests/real-redis-semaphore-latch.test.ts
 ```
 
 Integration tests auto-skip when Redis is not available at `localhost:6379`.
@@ -236,9 +236,9 @@ Integration tests auto-skip when Redis is not available at `localhost:6379`.
 
 ### Before Submitting
 
-- [ ] `npm run build` succeeds with no errors.
-- [ ] `npm run test:run` — all tests pass.
-- [ ] `npm run lint` — no lint violations.
+- [ ] `pnpm run build` succeeds with no errors.
+- [ ] `pnpm run test:run` — all tests pass.
+- [ ] `pnpm run lint` — no lint violations.
 - [ ] New code has test coverage.
 - [ ] No unrelated changes are included.
 
@@ -246,7 +246,7 @@ Integration tests auto-skip when Redis is not available at `localhost:6379`.
 
 For changes to core locking functionality, verify:
 
-- [ ] Lock acquire/release works with mocked Redis (`npm run test:run`).
+- [ ] Lock acquire/release works with mocked Redis (`pnpm run test:run`).
 - [ ] Integration tests pass with a real Redis instance (`tests/real-redis.test.ts`).
 - [ ] Auto-extension keeps locks alive during long operations.
 - [ ] Error handling returns meaningful messages (check custom error classes).
